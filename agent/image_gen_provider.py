@@ -73,8 +73,9 @@ def normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 
 def save_b64_image(b64_data: str, *, prefix: str = "image", extension: str = "png") -> Path:
-    """Decode base64 image data into ``$HERMES_HOME/cache/images/``; return the path."""
+    """Save an image using the profile's output directory or default image cache."""
     return provider_media.save_b64("images", b64_data, prefix=prefix, extension=extension)
+
 
 
 _URL_IMAGE_CONTENT_TYPES = {
