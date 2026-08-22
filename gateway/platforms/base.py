@@ -6,8 +6,10 @@ and implement the required methods.
 """
 
 import asyncio
+import base64
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -5081,6 +5083,58 @@ class BasePlatformAdapter(ABC):
         return cleaned.rstrip()
 
     @staticmethod
+    def extract_postgen_candidate_metadata(content: str) -> Tuple[Optional[dict], str]:
+        """Extract and strip a private PostgenBot candidate-button directive.
+
+        The directive shape is ``[[postgen_candidate:<base64url-json>]]``. The
+        decoded JSON is intentionally not placed in Telegram callback data;
+        adapters use a short candidate id in the button payload and persist the
+        rest locally for telemetry/accept handling.
+        """
+        if "[[postgen_candidate:" not in content:
+            return None, content
+
+        pattern = re.compile(r"\[\[postgen_candidate:([A-Za-z0-9_-]+)\]\]")
+        candidate: Optional[dict] = None
+
+        def _remove(match: re.Match) -> str:
+            nonlocal candidate
+            if candidate is None:
+                token = match.group(1)
+                padded = token + ("=" * (-len(token) % 4))
+                try:
+                    raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+                    decoded = json.loads(raw.decode("utf-8"))
+                    if isinstance(decoded, dict):
+                        allowed = {
+                            "id",
+                            "request_key",
+                            "result_path",
+                            "image_path",
+                            "postgen_theme",
+                            "headline_label",
+                            "artifact_kind",
+                            "gate_record_path",
+                            "gate_class",
+                            "artifact_sha256",
+                            "prompt_version",
+                            "compare_status",
+                            "qa_verdict",
+                        }
+                        candidate = {
+                            str(k): str(v)
+                            for k, v in decoded.items()
+                            if k in allowed and v not in (None, "")
+                        }
+                except Exception:
+                    logger.warning("Invalid postgen_candidate directive ignored")
+            return ""
+
+        cleaned = pattern.sub(_remove, content)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return candidate, cleaned
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native delivery.
@@ -6382,6 +6436,11 @@ class BasePlatformAdapter(ABC):
                 # Pre-extract snapshot for the #29346 recovery/invariant below.
                 _response_pre_extract = response
 
+                # Private PostgenBot candidate-button metadata rides alongside
+                # MEDIA: tags. Strip it before user-visible delivery, then pass
+                # it through send metadata so Telegram can attach inline buttons.
+                _postgen_candidate, response = self.extract_postgen_candidate_metadata(response)
+
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 media_files = self.filter_media_delivery_paths(media_files)
@@ -6455,6 +6514,9 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if _postgen_candidate:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["postgen_candidate"] = _postgen_candidate
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

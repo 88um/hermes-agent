@@ -7153,6 +7153,67 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- PostgenBot candidate-review callbacks (pg:action:id) ---
+        if data.startswith("pg:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer(text="Invalid candidate action.")
+                return
+            action_code, candidate_id = parts[1], parts[2]
+            action_map = {"a": "approve", "r": "reject", "v": "revise"}
+            action = action_map.get(action_code)
+            if not action:
+                await query.answer(text="Invalid candidate action.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to review this candidate.")
+                return
+            try:
+                workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+                helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+                if not helper.exists():
+                    await query.answer(text="Candidate telemetry helper missing.")
+                    return
+                import sys as _sys
+                proc = await asyncio.create_subprocess_exec(
+                    _sys.executable,
+                    str(helper),
+                    "action",
+                    "--id", candidate_id,
+                    "--action", action,
+                    "--actor", str(getattr(query.from_user, "id", "telegram")),
+                    cwd=str(workdir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                if proc.returncode != 0:
+                    await query.answer(text="Candidate action failed.")
+                    return
+                result = json.loads(stdout.decode("utf-8") or "{}")
+                label = str(result.get("label") or "Candidate feedback logged.")[:180]
+                await query.answer(text=label)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                if action == "revise" and query.message:
+                    try:
+                        await query.message.reply_text("Reply with what you want changed and I’ll revise it.")
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("[%s] postgen candidate callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text="Candidate action failed.")
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -7798,6 +7859,49 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
 
+    def _postgen_candidate_reply_markup(self, metadata: Optional[Dict[str, Any]] = None):
+        candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = str(candidate.get("id") or "").strip()
+        if not candidate_id or len(candidate_id.encode("utf-8")) > 48:
+            return None
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"pg:a:{candidate_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"pg:r:{candidate_id}"),
+            ],
+            [InlineKeyboardButton("✏️ Revise", callback_data=f"pg:v:{candidate_id}")],
+        ])
+
+    def _register_postgen_candidate(self, metadata: Optional[Dict[str, Any]], image_path: Optional[str] = None) -> None:
+        candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
+        if not isinstance(candidate, dict):
+            return
+        try:
+            workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+            helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+            if not helper.exists():
+                return
+            import subprocess as _subprocess
+            import sys as _sys
+            _subprocess.run(
+                [
+                    _sys.executable,
+                    str(helper),
+                    "register",
+                    "--candidate",
+                    json.dumps(candidate, ensure_ascii=False, separators=(",", ":")),
+                    *( ["--image-path", image_path] if image_path else [] ),
+                ],
+                cwd=str(workdir),
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("[%s] postgen candidate registration skipped: %s", self.name, exc)
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -7850,6 +7954,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         from urllib.parse import unquote as _unquote
+
+        # Candidate-review buttons cannot be attached to Telegram media groups.
+        # When a PostgenBot candidate directive accompanies a single image,
+        # route it through the one-photo path so the inline keyboard is attached
+        # directly to the candidate image.
+        if (metadata or {}).get("postgen_candidate") and len(photos) == 1:
+            image_url, alt_text = photos[0]
+            caption = alt_text[:1024] if alt_text else None
+            if image_url.startswith("file://"):
+                await self.send_image_file(
+                    chat_id=chat_id,
+                    image_path=_unquote(image_url[7:]),
+                    caption=caption,
+                    metadata=metadata,
+                )
+            else:
+                await self.send_image(
+                    chat_id=chat_id,
+                    image_url=image_url,
+                    caption=caption,
+                    metadata=metadata,
+                )
+            return
+
         _thread = self._metadata_thread_id(metadata)
 
         # Chunk into groups of 10 (Telegram's album limit)
@@ -7960,6 +8088,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
+            self._register_postgen_candidate(metadata, image_path=image_path)
+            reply_markup = self._postgen_candidate_reply_markup(metadata)
             with open(image_path, "rb") as image_file:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_photo,
@@ -7969,6 +8099,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        **({"reply_markup": reply_markup} if reply_markup else {}),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -8150,6 +8281,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        reply_markup = self._postgen_candidate_reply_markup(metadata)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
@@ -8166,6 +8298,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
+            self._register_postgen_candidate(metadata)
             msg = await self._send_with_dm_topic_reply_anchor_retry(
                 self._bot.send_photo,
                 {
@@ -8174,6 +8307,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
                     "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                    **({"reply_markup": reply_markup} if reply_markup else {}),
                     **photo_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -8217,6 +8351,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        **({"reply_markup": reply_markup} if reply_markup else {}),
                         **upload_thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
