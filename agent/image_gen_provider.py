@@ -234,8 +234,35 @@ def normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 
 def _images_cache_dir() -> Path:
-    """Return ``$HERMES_HOME/cache/images/``, creating parents as needed."""
+    """Return the directory generated images are written to.
+
+    ``image_gen.output_dir`` in config.yaml (absolute path, ``~`` expanded)
+    overrides the default ``$HERMES_HOME/cache/images/`` so profiles can keep
+    generated assets together inside a working directory. Falls back to the
+    default on any config error or an unwritable override.
+    """
     from hermes_constants import get_hermes_home
+
+    override: Optional[str] = None
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            value = section.get("output_dir")
+            if isinstance(value, str) and value.strip():
+                override = value.strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not read image_gen.output_dir: %s", exc)
+
+    if override:
+        try:
+            path = Path(override).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError as exc:
+            logger.warning("image_gen.output_dir %r unusable (%s); using default cache dir", override, exc)
 
     path = get_hermes_home() / "cache" / "images"
     path.mkdir(parents=True, exist_ok=True)
