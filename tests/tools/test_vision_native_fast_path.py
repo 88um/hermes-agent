@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 from io import BytesIO
 from unittest.mock import patch
@@ -151,6 +152,7 @@ class TestBuildNativeVisionToolResult:
         assert env["content"][1]["image_url"]["url"] == "data:image/png;base64,XYZ"
         assert "what does it say?" in env["content"][0]["text"]
         assert "Image attached natively" in env["text_summary"]
+        assert env["meta"]["file_reference"] == "/tmp/foo.png"
 
     def test_no_question_omits_question_section(self):
         env = _build_native_vision_tool_result(
@@ -181,6 +183,12 @@ class TestVisionAnalyzeNative:
         assert any(p.get("type") == "text" for p in parts)
         url = next(p["image_url"]["url"] for p in parts if p.get("type") == "image_url")
         assert url.startswith("data:image/")
+        assert result["meta"]["file_reference"] == str(img)
+        assert result["meta"]["content_sha256"] == hashlib.sha256(
+            base64.b64decode(url.split(",", 1)[1])
+        ).hexdigest()
+        assert result["meta"]["width"] == 1
+        assert result["meta"]["height"] == 1
 
     def test_truncated_supported_image_is_rejected_before_embedding(self, tmp_path):
         """A valid header must not let partially downloaded bytes poison history."""

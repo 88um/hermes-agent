@@ -7,6 +7,7 @@ model (multimodal tool-result envelope) or are described by the auxiliary vision
 """
 
 import base64
+import hashlib
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -492,6 +493,9 @@ def _should_use_native_vision_fast_path() -> bool:
 def _build_native_vision_tool_result(
     image_url: str, question: str, image_data_url: str, image_size_bytes: int,
     scale_note: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    content_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Multimodal tool-result envelope. The text part is intentionally minimal (the model already
     has the question); ``text_summary`` is the fallback for providers without multimodal tool results."""
@@ -502,6 +506,20 @@ def _build_native_vision_tool_result(
         text_part += f"\n\nQuestion: {question.strip()}"
     if scale_note:
         text_part += f"\n\nNote: {scale_note}"
+    # Keep identity in the text as well as the envelope: normal persistence and
+    # image eviction retain text parts without rewriting canonical history.
+    media = {
+        "fileReference": image_url[:200] if not image_url.startswith("data:") else "[inline image]",
+        "sizeBytes": image_size_bytes,
+        "width": width,
+        "height": height,
+        "contentSha256": content_sha256,
+    }
+    identity = "Image metadata: " + json.dumps(
+        {key: value for key, value in media.items() if value is not None},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    text_part += f"\n\n{identity}"
     return {
         "_multimodal": True,
         "content": [
@@ -509,8 +527,16 @@ def _build_native_vision_tool_result(
             {"type": "image_url", "image_url": {"url": image_data_url}}],
         "text_summary": (
             f"Image attached natively for the main model ({image_size_bytes / 1024:.1f} KB). "
-            "Answer using built-in vision."),
-        "meta": {"image_url": image_url[:200], "size_bytes": image_size_bytes, "native_vision": True}}
+            f"Answer using built-in vision.\n\n{identity}"),
+        "meta": {
+            "image_url": image_url[:200],
+            "file_reference": media["fileReference"],
+            "size_bytes": image_size_bytes,
+            "width": width,
+            "height": height,
+            "content_sha256": content_sha256,
+            "native_vision": True,
+        }}
 
 
 def _unlink_quietly(path: Optional[Path]) -> None:
@@ -634,13 +660,25 @@ async def _vision_analyze_native(
             # Reject rather than embed a session-wedging payload.
             if len(image_data_url) > _MAX_BASE64_BYTES:
                 return tool_error(_too_large_message(image_data_url), success=False)
+        embedded_bytes = base64.b64decode(image_data_url.split(",", 1)[1])
+        embedded_width: Optional[int] = None
+        embedded_height: Optional[int] = None
+        try:
+            from PIL import Image
+            with Image.open(BytesIO(embedded_bytes)) as embedded_image:
+                embedded_width, embedded_height = embedded_image.size
+        except (ImportError, OSError, ValueError):
+            # Dimensions are optional when Pillow cannot inspect the encoded format.
+            pass
         embedded = True
         if not reserved:
             _record_embed(image_url)
         return _build_native_vision_tool_result(
             image_url=image_url, question=question, image_data_url=image_data_url,
             image_size_bytes=prepared.size_bytes,
-            scale_note=_build_scale_note(_scale_info or None, prepared.crop_offset or None))
+            scale_note=_build_scale_note(_scale_info or None, prepared.crop_offset or None),
+            width=embedded_width, height=embedded_height,
+            content_sha256=hashlib.sha256(embedded_bytes).hexdigest())
     except Exception as exc:
         logger.warning("Native vision fast path failed: %s", exc)
         return tool_error(f"Native vision failed: {exc}", success=False)
