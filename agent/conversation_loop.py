@@ -47,6 +47,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.tool_dispatch_helpers import compact_consumed_tool_media
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -2161,6 +2162,7 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        compact_consumed_tool_media(messages)
         api_messages = []
         for idx, msg in enumerate(messages):
 
@@ -2266,6 +2268,7 @@ def run_conversation(
             # Strip length-continuation marks; not every transport drops underscore keys.
             api_msg.pop("_length_continuation_fragment", None)
             api_msg.pop("_length_continuation_nudge", None)
+            api_msg.pop("_transient_media", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields

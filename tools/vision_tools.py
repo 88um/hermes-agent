@@ -31,6 +31,8 @@ Usage:
 import base64
 import contextlib
 import asyncio
+import hashlib
+import io
 import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -1072,6 +1074,9 @@ def _build_native_vision_tool_result(
     image_data_url: str,
     image_size_bytes: int,
     scale_note: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    content_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the multimodal tool-result envelope returned by the fast path.
 
@@ -1117,8 +1122,11 @@ def _build_native_vision_tool_result(
         ],
         "text_summary": summary,
         "meta": {
-            "image_url": image_url[:200],
+            "file_reference": image_url[:200],
             "size_bytes": image_size_bytes,
+            "width": width,
+            "height": height,
+            "content_sha256": content_sha256,
             "native_vision": True,
         },
     }
@@ -1239,14 +1247,10 @@ async def _vision_analyze_native(
             temp_image_path, mime_type=detected_mime_type,
         )
 
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
+        # Proactive embed cap: the image is sent on the immediate model call,
+        # then replaced in canonical history by compact identity metadata.
+        # Anthropic still rejects any single base64 image over 5 MB or over
+        # 8000px per side, so resize below both ceilings before that call.
         _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
         _over_dims = await _run_encode_on_cpu_executor(
             _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
@@ -1273,6 +1277,15 @@ async def _vision_analyze_native(
                     success=False,
                 )
 
+        embedded_bytes = base64.b64decode(image_data_url.split(",", 1)[1])
+        embedded_width: Optional[int] = None
+        embedded_height: Optional[int] = None
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(embedded_bytes)) as embedded_image:
+                embedded_width, embedded_height = embedded_image.size
+        except Exception:
+            pass
         return _build_native_vision_tool_result(
             image_url=image_url,
             question=question,
@@ -1281,6 +1294,9 @@ async def _vision_analyze_native(
             scale_note=_build_scale_note(
                 _scale_info or None, _crop_offset or None,
             ),
+            width=embedded_width,
+            height=embedded_height,
+            content_sha256=hashlib.sha256(embedded_bytes).hexdigest(),
         )
 
     except Exception as exc:

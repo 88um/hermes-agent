@@ -531,12 +531,85 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def _multimodal_media_record(value: Any) -> Optional[Dict[str, Any]]:
+    """Return compact persistence metadata for a native-vision result."""
+    if not _is_multimodal_tool_result(value):
+        return None
+    meta = value.get("meta")
+    if not isinstance(meta, dict) or meta.get("native_vision") is not True:
+        return None
+    return {
+        "summary": _multimodal_text_summary(value),
+        "fileReference": meta.get("file_reference") or meta.get("image_url"),
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "contentSha256": meta.get("content_sha256"),
+        "sizeBytes": meta.get("size_bytes"),
+    }
+
+
+def _compact_tool_media_message(message: Dict[str, Any]) -> bool:
+    record = message.get("_transient_media")
+    if not isinstance(record, dict):
+        return False
+    message["content"] = json.dumps(
+        {
+            "summary": record.get("summary") or "Native image inspected.",
+            "media": {
+                key: value
+                for key, value in record.items()
+                if key != "summary" and value is not None
+            },
+            "note": "Image bytes removed after the native-vision response.",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    message.pop("_transient_media", None)
+    return True
+
+
+def compact_consumed_tool_media(messages: List[Dict[str, Any]]) -> int:
+    """Drop image bytes once a later assistant response has consumed them."""
+    assistant_indices = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    compacted = 0
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or "_transient_media" not in message:
+            continue
+        if any(assistant_index > index for assistant_index in assistant_indices):
+            compacted += int(_compact_tool_media_message(message))
+    return compacted
+
+
+def compact_all_tool_media(messages: List[Dict[str, Any]]) -> int:
+    """Drop every transient image before terminal session persistence."""
+    return sum(
+        int(_compact_tool_media_message(message))
+        for message in messages
+        if isinstance(message, dict)
+    )
+
+
+def persistent_tool_media_content(message: Dict[str, Any]) -> Optional[str]:
+    """Build DB-safe content without mutating a pending live tool result."""
+    record = message.get("_transient_media")
+    if not isinstance(record, dict):
+        return None
+    copy = dict(message)
+    _compact_tool_media_message(copy)
+    content = copy.get("content")
+    return content if isinstance(content, str) else None
+
 def make_tool_result_message(
     name: str,
     content: Any,
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    source_result: Any = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -578,6 +651,9 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    media_record = _multimodal_media_record(source_result)
+    if media_record is not None and isinstance(wrapped, list):
+        message["_transient_media"] = media_record
     return message
 
 
@@ -799,5 +875,8 @@ __all__ = [
     "_trajectory_normalize_msg",
     "_detect_upstream_elision",
     "_maybe_append_elision_notice",
+    "compact_consumed_tool_media",
+    "compact_all_tool_media",
+    "persistent_tool_media_content",
     "make_tool_result_message",
 ]

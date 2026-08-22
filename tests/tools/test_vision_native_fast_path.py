@@ -63,6 +63,7 @@ class TestBuildNativeVisionToolResult:
         assert env["content"][1]["image_url"]["url"] == "data:image/png;base64,XYZ"
         assert "what does it say?" in env["content"][0]["text"]
         assert "Image attached natively" in env["text_summary"]
+        assert env["meta"]["file_reference"] == "/tmp/foo.png"
 
     def test_no_question_omits_question_section(self):
         env = _build_native_vision_tool_result(
@@ -93,6 +94,10 @@ class TestVisionAnalyzeNative:
         assert any(p.get("type") == "text" for p in parts)
         url = next(p["image_url"]["url"] for p in parts if p.get("type") == "image_url")
         assert url.startswith("data:image/")
+        assert result["meta"]["file_reference"] == str(img)
+        assert result["meta"]["content_sha256"]
+        assert result["meta"]["width"] == 1
+        assert result["meta"]["height"] == 1
 
 
     def test_file_url_scheme_resolves(self, tmp_path):
@@ -107,13 +112,9 @@ class TestVisionAnalyzeNative:
     def test_oversized_image_resized_under_embed_cap(self, tmp_path):
         """Regression for the wedged-session incident (May 2026).
 
-        A vision tool-result image is baked into conversation history and
-        re-sent on every subsequent turn.  Anthropic rejects any single
-        base64 image over 5 MB with a 400, and immutable history means the
-        bad bytes can't be cleared by retrying — the session is permanently
-        wedged.  The native fast path must proactively resize down to the
-        embed cap (well under 5 MB) BEFORE embedding, not just at the 20 MB
-        hard ceiling.  Skips if Pillow isn't available (resize is a no-op).
+        The native image is available for its immediate model call before
+        history compaction. Anthropic rejects any single base64 image over
+        5 MB, so the fast path must resize below that cap before embedding.
         """
         pytest = __import__("pytest")
         try:
