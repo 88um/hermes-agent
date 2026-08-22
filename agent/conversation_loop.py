@@ -35,6 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
+from agent.tool_dispatch_helpers import compact_consumed_tool_media
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -751,6 +752,7 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        compact_consumed_tool_media(messages)
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
@@ -786,6 +788,7 @@ def run_conversation(
                 api_msg.pop("finish_reason")
             # Strip internal thinking-prefill marker
             api_msg.pop("_thinking_prefill", None)
+            api_msg.pop("_transient_media", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields

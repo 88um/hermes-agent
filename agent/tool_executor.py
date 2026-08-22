@@ -827,7 +827,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
-        messages.append(make_tool_result_message(name, _tool_content, tc.id))
+        messages.append(make_tool_result_message(
+            name,
+            _tool_content,
+            tc.id,
+            source_result=function_result,
+        ))
         _flush_session_db_after_tool_progress(
             agent,
             messages,
@@ -1476,7 +1481,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+        messages.append(make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            source_result=function_result,
+        ))
         _flush_session_db_after_tool_progress(
             agent,
             messages,

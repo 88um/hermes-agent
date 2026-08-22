@@ -209,6 +209,8 @@ from agent.tool_dispatch_helpers import (
     _extract_landed_file_mutation_paths,
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
+    compact_all_tool_media,
+    persistent_tool_media_content,
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
@@ -1542,6 +1544,7 @@ class AIAgent:
         """
         self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
+        compact_all_tool_media(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
@@ -1656,10 +1659,13 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                persistent_media = persistent_tool_media_content(msg)
+                if persistent_media is not None:
+                    content = persistent_media
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
-                if _is_multimodal_tool_result(content):
+                if persistent_media is None and _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
                     # List of OpenAI-style content parts: strip images, keep text.
