@@ -7,6 +7,12 @@ the Codex Responses API ``image_generation`` tool instead of the
 authenticated with Codex/ChatGPT generate images without configuring a
 separate ``OPENAI_API_KEY``.
 
+Image-to-image / editing is supported: source images (``image_url`` plus any
+``reference_image_urls``) are inlined as ``input_image`` content parts on the
+Responses request, and the ``image_generation`` tool uses them as the edit
+source — the same mechanism ChatGPT uses when a user attaches an image and
+asks for changes.
+
 Selection precedence for the tier (first hit wins):
 
 1. ``OPENAI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
@@ -133,8 +139,6 @@ _MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 _ACCEPTED_INPUT_MIME = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
-
-
 # ---------------------------------------------------------------------------
 # Config + auth helpers
 # ---------------------------------------------------------------------------
@@ -313,6 +317,7 @@ def _build_responses_payload(
     input_images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Build the Codex Responses request body for an image_generation call."""
+    editing = bool(input_images)
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
     if input_images:
         content.extend(input_images)
@@ -331,7 +336,7 @@ def _build_responses_payload(
             "size": size,
             "quality": quality,
             "output_format": "png",
-            "background": "opaque",
+            "background": "auto" if editing else "opaque",
             # Prefer 0 progressive preview frames. Preview frames can arrive
             # without a later final ``result`` and look like smeared /
             # unfinished images if saved as the deliverable. Even when the

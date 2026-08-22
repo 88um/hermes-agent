@@ -145,7 +145,10 @@ class TestGenerate:
         assert captured["store"] is False
         assert captured["input"][0]["type"] == "message"
         assert captured["input"][0]["role"] == "user"
-        assert captured["input"][0]["content"][0]["type"] == "input_text"
+        assert captured["input"][0]["content"] == [
+            {"type": "input_text", "text": "a cat"},
+        ]
+        assert captured["instructions"] == codex_plugin._CODEX_INSTRUCTIONS
         # Regression for #19505: the Codex backend 400s on every tool_choice
         # shape we have for the hosted ``image_generation`` tool, so the
         # provider must omit tool_choice entirely and rely on instructions.
@@ -179,6 +182,81 @@ class TestGenerate:
         assert result["error_type"] == "invalid_image_input"
         assert "not a supported image" in result["error"]
 
+
+    def test_capabilities_declare_image_editing(self, provider):
+        caps = provider.capabilities()
+        assert caps["modalities"] == ["text", "image"]
+        assert caps["max_reference_images"] == 16
+
+    def test_edit_request_attaches_input_images(self, provider, monkeypatch, tmp_path):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        src = tmp_path / "source.png"
+        src.write_bytes(bytes.fromhex(_PNG_HEX))
+
+        captured = {}
+
+        def _collect(token, *, prompt, size, quality, input_images=None):
+            captured.update(codex_plugin._build_responses_payload(
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                input_images=input_images,
+            ))
+            return {"b64": _b64_png(), "source": "final"}
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate(
+            "make the shirt green",
+            image_url=str(src),
+            reference_image_urls=[str(src)],
+        )
+        assert result["success"] is True
+        assert result["modality"] == "image"
+
+        content = captured["input"][0]["content"]
+        assert content[0] == {"type": "input_text", "text": "make the shirt green"}
+        assert [part["type"] for part in content[1:]] == ["input_image", "input_image"]
+        assert all(
+            part["image_url"].startswith("data:image/png;base64,")
+            for part in content[1:]
+        )
+        assert captured["instructions"] == codex_plugin._CODEX_INSTRUCTIONS
+        # Edits keep transparency: background switches from opaque to auto.
+        assert captured["tools"][0]["background"] == "auto"
+
+    def test_edit_with_unreadable_source_returns_io_error(self, provider, monkeypatch, tmp_path):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate(
+            "make the shirt green",
+            image_url=str(tmp_path / "missing.png"),
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_image_input"
+
+    def test_edit_sources_capped_at_limit(self, provider, monkeypatch, tmp_path):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        src = tmp_path / "source.png"
+        src.write_bytes(bytes.fromhex(_PNG_HEX))
+
+        captured = {}
+
+        def _collect(token, *, prompt, size, quality, input_images=None):
+            captured["count"] = len(input_images or [])
+            return {"b64": _b64_png(), "source": "final"}
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate(
+            "make the shirt green",
+            image_url=str(src),
+            reference_image_urls=[str(src)] * 20,
+        )
+        assert result["success"] is True
+        assert captured["count"] == codex_plugin._MAX_REFERENCE_IMAGES
 
     def test_partial_image_event_used_when_done_missing(self):
         """Extractor may surface partial b64 when no final exists (fallback only)."""
