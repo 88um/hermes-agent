@@ -4631,12 +4631,76 @@ class TelegramAdapter(BasePlatformAdapter):
                     await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("pg:", self._handle_postgen_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_postgen_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        query_chat_id, query_chat_type = cb["chat_id"], cb["chat_type"]
+        query_thread_id, query_user_name = cb["thread_id"], cb["user_name"]
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid candidate action.")
+            return
+        action_code, candidate_id = parts[1], parts[2]
+        action_map = {"a": "approve", "r": "reject", "v": "revise"}
+        action = action_map.get(action_code)
+        if not action:
+            await query.answer(text="Invalid candidate action.")
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to review this candidate.")
+            return
+        try:
+            workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+            helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+            if not helper.exists():
+                await query.answer(text="Candidate telemetry helper missing.")
+                return
+            import sys as _sys
+            proc = await asyncio.create_subprocess_exec(
+                _sys.executable,
+                str(helper),
+                "action",
+                "--id", candidate_id,
+                "--action", action,
+                "--actor", str(getattr(query.from_user, "id", "telegram")),
+                cwd=str(workdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                await query.answer(text="Candidate action failed.")
+                return
+            result = json.loads(stdout.decode("utf-8") or "{}")
+            label = str(result.get("label") or "Candidate feedback logged.")[:180]
+            await query.answer(text=label)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if action == "revise" and query.message:
+                try:
+                    await query.message.reply_text("Reply with what you want changed and I’ll revise it.")
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[%s] postgen candidate callback failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Candidate action failed.")
+        return
+
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
@@ -5139,6 +5203,49 @@ class TelegramAdapter(BasePlatformAdapter):
                 with contextlib.suppress(OSError):
                     os.unlink(_transcoded_voice_path)
 
+    def _postgen_candidate_reply_markup(self, metadata: Optional[Dict[str, Any]] = None):
+        candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = str(candidate.get("id") or "").strip()
+        if not candidate_id or len(candidate_id.encode("utf-8")) > 48:
+            return None
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"pg:a:{candidate_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"pg:r:{candidate_id}"),
+            ],
+            [InlineKeyboardButton("✏️ Revise", callback_data=f"pg:v:{candidate_id}")],
+        ])
+
+    def _register_postgen_candidate(self, metadata: Optional[Dict[str, Any]], image_path: Optional[str] = None) -> None:
+        candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
+        if not isinstance(candidate, dict):
+            return
+        try:
+            workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+            helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+            if not helper.exists():
+                return
+            import subprocess as _subprocess
+            import sys as _sys
+            _subprocess.run(
+                [
+                    _sys.executable,
+                    str(helper),
+                    "register",
+                    "--candidate",
+                    json.dumps(candidate, ensure_ascii=False, separators=(",", ":")),
+                    *( ["--image-path", image_path] if image_path else [] ),
+                ],
+                cwd=str(workdir),
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("[%s] postgen candidate registration skipped: %s", self.name, exc)
+
     async def send_multiple_images(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
@@ -5162,6 +5269,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not photos:
             return SendResult(success=delivered, error=None if delivered else "all images failed to send")
         from urllib.parse import unquote as _unquote
+        if (metadata or {}).get("postgen_candidate") and len(photos) == 1:
+            image_url, alt_text = photos[0]
+            if image_url.startswith("file://"):
+                return await self.send_image_file(chat_id, _unquote(image_url[7:]), alt_text, metadata=metadata)
+            return await self.send_image(chat_id, image_url, alt_text, metadata=metadata)
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
         for chunk_idx, chunk in enumerate(chunks):
@@ -5222,6 +5334,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Telegram photo."""
         # Pre-compress large raster images to progressive JPEG once; the photo send and the document
         # fallback both reuse the compressed file so either upload stays under media_write_timeout.
+        self._register_postgen_candidate(metadata, image_path=image_path)
+        reply_markup = self._postgen_candidate_reply_markup(metadata)
         compressed = self._compress_image_to_jpeg(image_path)
         actual_path = compressed or image_path
         doc_name = os.path.splitext(os.path.basename(image_path))[0] + ".jpg" if compressed else os.path.basename(image_path)
@@ -5249,7 +5363,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             return await self._send_local_file(
                 "Image", actual_path, chat_id, reply_to, metadata, "photo",
-                lambda f: {"photo": f, "caption": self._caption_1024(caption)}, _photo_failed)
+                lambda f: {"photo": f, "caption": self._caption_1024(caption), **({"reply_markup": reply_markup} if reply_markup else {})}, _photo_failed)
         finally:
             if compressed:
                 with contextlib.suppress(OSError):
@@ -5329,6 +5443,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a URL image as a Telegram photo: URL send (<5MB) → download+upload (≤10MB) → base text."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        self._register_postgen_candidate(metadata)
+        reply_markup = self._postgen_candidate_reply_markup(metadata)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
@@ -5336,7 +5452,7 @@ class TelegramAdapter(BasePlatformAdapter):
         photo_caption = self._caption_1024(caption)
         try:
             msg = await self._send_media(
-                self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption)
+                self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -5349,7 +5465,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     resp.raise_for_status()
                     image_data = resp.content
                 msg = await self._send_media(
-                    self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption)
+                    self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)
