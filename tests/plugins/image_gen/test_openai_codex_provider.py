@@ -173,6 +173,7 @@ class TestGenerate:
         assert result["input_image_count"] == 2
         (request,) = codex_backend["requests"]
         assert request.url.path.endswith("/backend-api/codex/images/edits")
+        assert json.loads(request.content)["background"] == "auto"
         body = json.loads(request.content)
         assert [img["image_url"] for img in body["images"]] == [data_url, data_url]
 

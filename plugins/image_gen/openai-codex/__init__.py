@@ -177,7 +177,7 @@ def _build_image_request(
     ``ImageEditRequest``."""
     body: Dict[str, Any] = {
         "prompt": prompt, "model": API_MODEL, "n": 1, "quality": quality, "size": size,
-        "background": "opaque",
+        "background": "auto" if input_images else "opaque",
     }
     if input_images:
         body["images"] = input_images
