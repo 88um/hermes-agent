@@ -7859,12 +7859,86 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
 
-    def _postgen_candidate_reply_markup(self, metadata: Optional[Dict[str, Any]] = None):
+    def _postgen_candidate_id(self, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
         if not isinstance(candidate, dict):
             return None
         candidate_id = str(candidate.get("id") or "").strip()
-        if not candidate_id or len(candidate_id.encode("utf-8")) > 48:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", candidate_id):
+            logger.warning(
+                "[%s] postgen_candidate_directive_invalid: unusable candidate id "
+                "(len=%s); no buttons attached",
+                self.name, len(candidate_id),
+            )
+            return None
+        return candidate_id
+
+    def _resolve_postgen_candidate(self, candidate_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve a short candidate id against the operator registry.
+
+        The helper registered the full candidate (result/gate paths, verification
+        state) before delivery; this only confirms the id exists, is still
+        pending, and returns its stored metadata. Unknown/stale/already-actioned
+        ids produce no buttons and a structured failure log.
+        """
+        try:
+            workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+            helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+            if not helper.exists():
+                logger.warning(
+                    "[%s] postgen_candidate_unresolved: helper missing for id=%s",
+                    self.name, candidate_id,
+                )
+                self._log_postgen_candidate_failure(candidate_id)
+                return None
+            import subprocess as _subprocess
+            import sys as _sys
+            completed = _subprocess.run(
+                [_sys.executable, str(helper), "resolve", "--id", candidate_id],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] postgen_candidate_unresolved: id=%s not actionable in "
+                    "registry (rc=%d); no buttons attached",
+                    self.name, candidate_id, completed.returncode,
+                )
+                self._log_postgen_candidate_failure(candidate_id)
+                return None
+            payload = json.loads(completed.stdout or "{}")
+            if not payload.get("ok"):
+                logger.warning(
+                    "[%s] postgen_candidate_unresolved: id=%s rejected (%s); no buttons attached",
+                    self.name, candidate_id, payload.get("reason"),
+                )
+                self._log_postgen_candidate_failure(candidate_id)
+                return None
+            row = payload.get("candidate")
+            if not isinstance(row, dict) or row.get("id") != candidate_id:
+                logger.warning(
+                    "[%s] postgen_candidate_unresolved: id=%s registry response invalid; no buttons attached",
+                    self.name, candidate_id,
+                )
+                self._log_postgen_candidate_failure(candidate_id)
+                return None
+            return row
+        except Exception as exc:
+            logger.warning(
+                "[%s] postgen_candidate_unresolved: id=%s lookup failed: %s",
+                self.name, candidate_id, exc,
+            )
+            self._log_postgen_candidate_failure(candidate_id)
+            return None
+
+    def _postgen_candidate_reply_markup(self, candidate_row: Optional[Dict[str, Any]]):
+        if not isinstance(candidate_row, dict):
+            return None
+        candidate_id = str(candidate_row.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", candidate_id):
             return None
         return InlineKeyboardMarkup([
             [
@@ -7874,33 +7948,88 @@ class TelegramAdapter(BasePlatformAdapter):
             [InlineKeyboardButton("✏️ Revise", callback_data=f"pg:v:{candidate_id}")],
         ])
 
-    def _register_postgen_candidate(self, metadata: Optional[Dict[str, Any]], image_path: Optional[str] = None) -> None:
-        candidate = (metadata or {}).get("postgen_candidate") if isinstance(metadata, dict) else None
-        if not isinstance(candidate, dict):
-            return
+    def _log_postgen_candidate_failure(self, candidate_id: str) -> None:
+        """Structured telemetry for a candidate id that produced no buttons."""
         try:
             workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
-            helper = workdir / "scripts" / "postgen_candidate_buttons.py"
-            if not helper.exists():
+            action_log = workdir / "scripts" / "action_log.py"
+            if not action_log.exists():
                 return
             import subprocess as _subprocess
             import sys as _sys
-            _subprocess.run(
+            completed = _subprocess.run(
                 [
-                    _sys.executable,
-                    str(helper),
-                    "register",
-                    "--candidate",
-                    json.dumps(candidate, ensure_ascii=False, separators=(",", ":")),
-                    *( ["--image-path", image_path] if image_path else [] ),
+                    _sys.executable, str(action_log), "log",
+                    "--phase", "delivery",
+                    "--action", "candidate_send_failed",
+                    "--status", "failed",
+                    "--tool", "telegram",
+                    "--issue-code", "postgen_candidate_unresolved",
+                    "--request-key", f"unknown:{candidate_id}",
+                    "--details", json.dumps({"reason": "unresolved_candidate", "id": candidate_id}, separators=(",", ":")),
                 ],
                 cwd=str(workdir),
                 stdout=_subprocess.DEVNULL,
                 stderr=_subprocess.DEVNULL,
+                timeout=30,
                 check=False,
             )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] postgen_candidate_failure_log_failed: id=%s rc=%d",
+                    self.name, candidate_id, completed.returncode,
+                )
         except Exception as exc:
-            logger.debug("[%s] postgen candidate registration skipped: %s", self.name, exc)
+            logger.warning(
+                "[%s] postgen_candidate_failure_log_failed: id=%s error=%s",
+                self.name, candidate_id, exc,
+            )
+
+    def _log_postgen_candidate_delivery(
+        self,
+        candidate_row: Optional[Dict[str, Any]],
+        attached: bool,
+        message_id: Optional[str] = None,
+    ) -> None:
+        """Record candidate delivery only after Telegram confirmed the send.
+
+        ``candidate_sent`` requires a non-null reply markup on a successful
+        photo send; anything else is recorded as a structured failure so
+        delivery telemetry can never claim buttons that were never sent.
+        """
+        if not isinstance(candidate_row, dict) or not candidate_row.get("id"):
+            return
+        workdir = _Path(os.getenv("POSTGEN_BOT_WORKDIR", "/Users/joshua/postgen-bot-work"))
+        helper = workdir / "scripts" / "postgen_candidate_buttons.py"
+        if not helper.exists():
+            return
+        try:
+            import subprocess as _subprocess
+            import sys as _sys
+            args = [
+                _sys.executable, str(helper), "delivery",
+                "--id", str(candidate_row["id"]),
+                "--buttons-attached" if attached else "--no-buttons-attached",
+                *(["--message-id", str(message_id)] if message_id is not None else []),
+            ]
+            completed = _subprocess.run(
+                args,
+                cwd=str(workdir),
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] postgen_candidate_delivery_log_failed: id=%s rc=%d",
+                    self.name, candidate_row["id"], completed.returncode,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] postgen_candidate_delivery_log_failed: id=%s error=%s",
+                self.name, candidate_row.get("id"), exc,
+            )
 
     async def send_multiple_images(
         self,
@@ -8075,8 +8204,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        candidate_id = self._postgen_candidate_id(metadata)
+        candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
         try:
             if not os.path.exists(image_path):
+                self._log_postgen_candidate_delivery(candidate_row, attached=False)
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
 
             _thread = self._metadata_thread_id(metadata)
@@ -8088,8 +8220,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
-            self._register_postgen_candidate(metadata, image_path=image_path)
-            reply_markup = self._postgen_candidate_reply_markup(metadata)
+            reply_markup = self._postgen_candidate_reply_markup(candidate_row)
             with open(image_path, "rb") as image_file:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_photo,
@@ -8108,8 +8239,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     "photo",
                     reset_media=lambda: image_file.seek(0),
                 )
+            # Delivery telemetry only after Telegram confirmed the photo with
+            # its (non-null) inline keyboard attached.
+            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=getattr(msg, "message_id", None))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if 'candidate_row' in locals() and candidate_row is not None:
+                self._log_postgen_candidate_delivery(candidate_row, attached=False)
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
             # files that Telegram just refuses as photos (screenshots, extreme
@@ -8281,10 +8417,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        reply_markup = self._postgen_candidate_reply_markup(metadata)
+        candidate_id = self._postgen_candidate_id(metadata)
+        candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        reply_markup = self._postgen_candidate_reply_markup(candidate_row)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
+            self._log_postgen_candidate_delivery(candidate_row, attached=False)
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
         try:
@@ -8298,7 +8437,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
-            self._register_postgen_candidate(metadata)
             msg = await self._send_with_dm_topic_reply_anchor_retry(
                 self._bot.send_photo,
                 {
@@ -8315,6 +8453,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "URL photo",
             )
+            # Delivery telemetry only after Telegram confirmed the photo with
+            # its (non-null) inline keyboard attached.
+            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=getattr(msg, "message_id", None))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -8359,8 +8500,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "uploaded photo",
                 )
+                self._log_postgen_candidate_delivery(
+                    candidate_row,
+                    attached=reply_markup is not None,
+                    message_id=getattr(msg, "message_id", None),
+                )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
+                if candidate_row is not None:
+                    self._log_postgen_candidate_delivery(candidate_row, attached=False)
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
                     self.name,

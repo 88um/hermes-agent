@@ -5086,51 +5086,56 @@ class BasePlatformAdapter(ABC):
     def extract_postgen_candidate_metadata(content: str) -> Tuple[Optional[dict], str]:
         """Extract and strip a private PostgenBot candidate-button directive.
 
-        The directive shape is ``[[postgen_candidate:<base64url-json>]]``. The
-        decoded JSON is intentionally not placed in Telegram callback data;
-        adapters use a short candidate id in the button payload and persist the
-        rest locally for telemetry/accept handling.
+        The directive shape is ``[[postgen_candidate_id:<short-id>]]`` — a short,
+        low-entropy, human-copyable id emitted by the operator helper, which has
+        already registered the full candidate (result/gate paths, verification
+        state) locally before delivery. The id is intentionally the only thing
+        that travels through model output: opaque base64 tokens get abbreviated
+        by tool-output redaction and must never be relayed by the model again.
+        Adapters resolve the id against the local registry; Telegram callback
+        data stays a short ``pg:<action>:<id>`` payload.
+
+        Any directive-looking token that is not a well-formed short id — the
+        legacy base64 form, an ellipsized/redacted token containing ``...``,
+        empty or over-long ids — is stripped from user-visible text, logged with
+        the stable code ``postgen_candidate_directive_invalid``, and never
+        yields candidate metadata (so it can never be counted as a delivery).
         """
-        if "[[postgen_candidate:" not in content:
+        if "[[postgen_candidate" not in content:
             return None, content
 
-        pattern = re.compile(r"\[\[postgen_candidate:([A-Za-z0-9_-]+)\]\]")
+        pattern = re.compile(r"\[\[postgen_candidate(?:_id)?:([^\]]*)\]\]")
         candidate: Optional[dict] = None
 
         def _remove(match: re.Match) -> str:
             nonlocal candidate
-            if candidate is None:
-                token = match.group(1)
-                padded = token + ("=" * (-len(token) % 4))
-                try:
-                    raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-                    decoded = json.loads(raw.decode("utf-8"))
-                    if isinstance(decoded, dict):
-                        allowed = {
-                            "id",
-                            "request_key",
-                            "result_path",
-                            "image_path",
-                            "postgen_theme",
-                            "headline_label",
-                            "artifact_kind",
-                            "gate_record_path",
-                            "gate_class",
-                            "artifact_sha256",
-                            "prompt_version",
-                            "compare_status",
-                            "qa_verdict",
-                        }
-                        candidate = {
-                            str(k): str(v)
-                            for k, v in decoded.items()
-                            if k in allowed and v not in (None, "")
-                        }
-                except Exception:
-                    logger.warning("Invalid postgen_candidate directive ignored")
+            is_short_form = match.group(0).startswith("[[postgen_candidate_id:")
+            token = match.group(1).strip()
+            if candidate is None and is_short_form and re.fullmatch(r"[A-Za-z0-9_-]{1,48}", token):
+                candidate = {"id": token}
+            else:
+                logger.warning(
+                    "postgen_candidate_directive_invalid: stripped malformed or "
+                    "abbreviated candidate directive (len=%d); no buttons attached",
+                    len(token),
+                )
             return ""
 
         cleaned = pattern.sub(_remove, content)
+        # Also remove an unterminated directive through the end of its line.
+        # The closed-token regex above cannot see this malformed case, but it
+        # must never leak private protocol text into the Telegram caption.
+        if "[[postgen_candidate" in cleaned:
+            cleaned, malformed_count = re.subn(
+                r"\[\[postgen_candidate[^\r\n]*",
+                "",
+                cleaned,
+            )
+            for _ in range(malformed_count):
+                logger.warning(
+                    "postgen_candidate_directive_invalid: stripped unterminated "
+                    "candidate directive; no buttons attached"
+                )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return candidate, cleaned
 
