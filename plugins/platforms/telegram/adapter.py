@@ -7182,6 +7182,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="Candidate telemetry helper missing.")
                     return
                 import sys as _sys
+                _callback_started_ms = int(time.time() * 1000)
                 proc = await asyncio.create_subprocess_exec(
                     _sys.executable,
                     str(helper),
@@ -7189,6 +7190,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "--id", candidate_id,
                     "--action", action,
                     "--actor", str(getattr(query.from_user, "id", "telegram")),
+                    "--started-at-ms", str(_callback_started_ms),
                     cwd=str(workdir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
@@ -7990,6 +7992,7 @@ class TelegramAdapter(BasePlatformAdapter):
         candidate_row: Optional[Dict[str, Any]],
         attached: bool,
         message_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
     ) -> None:
         """Record candidate delivery only after Telegram confirmed the send.
 
@@ -8011,6 +8014,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--id", str(candidate_row["id"]),
                 "--buttons-attached" if attached else "--no-buttons-attached",
                 *(["--message-id", str(message_id)] if message_id is not None else []),
+                *(["--duration-ms", str(duration_ms)] if duration_ms is not None else []),
             ]
             completed = _subprocess.run(
                 args,
@@ -8206,9 +8210,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        _delivery_started = time.monotonic()
         try:
             if not os.path.exists(image_path):
-                self._log_postgen_candidate_delivery(candidate_row, attached=False)
+                self._log_postgen_candidate_delivery(
+                    candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                )
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
 
             _thread = self._metadata_thread_id(metadata)
@@ -8240,12 +8249,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: image_file.seek(0),
                 )
             # Delivery telemetry only after Telegram confirmed the photo with
-            # its (non-null) inline keyboard attached.
-            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=getattr(msg, "message_id", None))
+            # its (non-null) inline keyboard attached. The send duration is
+            # measured so cycle-time telemetry has non-null delivery timing.
+            self._log_postgen_candidate_delivery(
+                candidate_row,
+                attached=reply_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             if 'candidate_row' in locals() and candidate_row is not None:
-                self._log_postgen_candidate_delivery(candidate_row, attached=False)
+                self._log_postgen_candidate_delivery(
+                    candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                )
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
             # files that Telegram just refuses as photos (screenshots, extreme
@@ -8419,11 +8438,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        _delivery_started = time.monotonic()
         reply_markup = self._postgen_candidate_reply_markup(candidate_row)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
-            self._log_postgen_candidate_delivery(candidate_row, attached=False)
+            self._log_postgen_candidate_delivery(
+                candidate_row,
+                attached=False,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
         try:
@@ -8454,8 +8478,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 "URL photo",
             )
             # Delivery telemetry only after Telegram confirmed the photo with
-            # its (non-null) inline keyboard attached.
-            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=getattr(msg, "message_id", None))
+            # its (non-null) inline keyboard attached, with measured timing.
+            self._log_postgen_candidate_delivery(
+                candidate_row,
+                attached=reply_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -8504,11 +8533,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     candidate_row,
                     attached=reply_markup is not None,
                     message_id=getattr(msg, "message_id", None),
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
                 if candidate_row is not None:
-                    self._log_postgen_candidate_delivery(candidate_row, attached=False)
+                    self._log_postgen_candidate_delivery(
+                        candidate_row,
+                        attached=False,
+                        duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                    )
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
                     self.name,
