@@ -192,7 +192,9 @@ def test_send_image_file_attaches_markup_and_logs_confirmed_delivery(adapter, mo
     monkeypatch.setattr(
         adapter,
         "_log_postgen_candidate_delivery",
-        lambda row, attached, message_id=None: deliveries.append((row, attached, message_id)),
+        lambda row, attached, message_id=None, duration_ms=None: deliveries.append(
+            (row, attached, message_id, duration_ms)
+        ),
     )
     metadata = {
         "postgen_candidate": {"id": "gta6q1"},
@@ -208,7 +210,9 @@ def test_send_image_file_attaches_markup_and_logs_confirmed_delivery(adapter, mo
         "pg:r:gta6q1",
         "pg:v:gta6q1",
     ]
-    assert deliveries == [(CANDIDATE_ROW, True, 4242)]
+    assert len(deliveries) == 1
+    assert deliveries[0][:3] == (CANDIDATE_ROW, True, 4242)
+    assert deliveries[0][3] is not None
 
 
 def test_send_image_file_without_a_resolvable_candidate_sends_plain_photo(adapter, monkeypatch, tmp_path):
@@ -230,7 +234,9 @@ def test_send_image_file_without_a_resolvable_candidate_sends_plain_photo(adapte
     monkeypatch.setattr(
         adapter,
         "_log_postgen_candidate_delivery",
-        lambda row, attached, message_id=None: deliveries.append((row, attached, message_id)),
+        lambda row, attached, message_id=None, duration_ms=None: deliveries.append(
+            (row, attached, message_id, duration_ms)
+        ),
     )
     metadata = {"postgen_candidate": {"id": "stale-id"}}
 
@@ -238,7 +244,42 @@ def test_send_image_file_without_a_resolvable_candidate_sends_plain_photo(adapte
 
     assert result.success
     assert "reply_markup" not in captured
-    assert deliveries == [(None, False, 7)]
+    assert len(deliveries) == 1
+    assert deliveries[0][:3] == (None, False, 7)
+    assert deliveries[0][3] is not None
+
+
+def test_send_image_file_failure_records_a_measured_delivery_duration(adapter, monkeypatch, tmp_path):
+    image_path = tmp_path / "final.png"
+    image_path.write_bytes(b"png")
+
+    async def fail_send_photo(**kwargs):
+        raise RuntimeError("telegram photo failure")
+
+    async def successful_document_fallback(**kwargs):
+        return SimpleNamespace(success=True, message_id="doc-1")
+
+    adapter._bot = SimpleNamespace(send_photo=fail_send_photo)
+    monkeypatch.setattr(adapter, "_resolve_postgen_candidate", lambda candidate_id: CANDIDATE_ROW)
+    monkeypatch.setattr(adapter, "send_document", successful_document_fallback)
+    deliveries = []
+    monkeypatch.setattr(
+        adapter,
+        "_log_postgen_candidate_delivery",
+        lambda row, attached, message_id=None, duration_ms=None: deliveries.append(
+            (row, attached, message_id, duration_ms)
+        ),
+    )
+
+    result = asyncio.run(adapter.send_image_file(
+        chat_id="123",
+        image_path=str(image_path),
+        metadata={"postgen_candidate": {"id": "gta6q1"}},
+    ))
+
+    assert result.success
+    assert deliveries[0][:3] == (CANDIDATE_ROW, False, None)
+    assert deliveries[0][3] is not None
 
 
 def test_resolve_failure_paths_are_logged_as_structured_failures(adapter, monkeypatch, tmp_path):
@@ -284,13 +325,33 @@ def test_confirmed_delivery_uses_helper_without_unsupported_log_flags(adapter, m
 
     monkeypatch.setattr(subprocess_module, "run", fake_run)
 
-    adapter._log_postgen_candidate_delivery(CANDIDATE_ROW, True, 4242)
+    adapter._log_postgen_candidate_delivery(CANDIDATE_ROW, True, 4242, duration_ms=812)
 
     assert len(commands) == 1
-    assert commands[0][2:] == [
-        "delivery", "--id", "gta6q1", "--buttons-attached", "--message-id", "4242",
+    assert commands[0][2:10] == [
+        "delivery", "--id", "gta6q1", "--buttons-attached", "--message-id", "4242", "--duration-ms", "812",
     ]
     assert "--headline-label" not in commands[0]
+
+
+def test_delivery_timing_flag_is_omitted_when_not_measured(adapter, monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setenv("POSTGEN_BOT_WORKDIR", str(tmp_path))
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "postgen_candidate_buttons.py").write_text("# helper\n")
+    import subprocess as subprocess_module
+
+    monkeypatch.setattr(subprocess_module, "run", fake_run)
+
+    adapter._log_postgen_candidate_delivery(CANDIDATE_ROW, False, None)
+
+    assert commands[0][2:] == ["delivery", "--id", "gta6q1", "--no-buttons-attached"]
+    assert "--duration-ms" not in commands[0]
 
 
 def test_end_to_end_helper_marker_to_buttoned_send(adapter, monkeypatch, tmp_path):
