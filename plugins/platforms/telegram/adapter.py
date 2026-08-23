@@ -4669,6 +4669,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Candidate telemetry helper missing.")
                 return
             import sys as _sys
+            _callback_started_ms = int(time.time() * 1000)
             proc = await asyncio.create_subprocess_exec(
                 _sys.executable,
                 str(helper),
@@ -4676,6 +4677,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--id", candidate_id,
                 "--action", action,
                 "--actor", str(getattr(query.from_user, "id", "telegram")),
+                "--started-at-ms", str(_callback_started_ms),
                 cwd=str(workdir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -5334,6 +5336,7 @@ class TelegramAdapter(BasePlatformAdapter):
         candidate_row: Optional[Dict[str, Any]],
         attached: bool,
         message_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
     ) -> None:
         """Record candidate delivery only after Telegram confirmed the send.
 
@@ -5355,6 +5358,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--id", str(candidate_row["id"]),
                 "--buttons-attached" if attached else "--no-buttons-attached",
                 *(["--message-id", str(message_id)] if message_id is not None else []),
+                *(["--duration-ms", str(duration_ms)] if duration_ms is not None else []),
             ]
             completed = _subprocess.run(
                 args,
@@ -5463,6 +5467,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Telegram photo."""
         # Pre-compress large raster images to progressive JPEG once; the photo send and the document
         # fallback both reuse the compressed file so either upload stays under media_write_timeout.
+        _delivery_started = time.monotonic()
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
         reply_markup = self._postgen_candidate_reply_markup(candidate_row)
@@ -5471,7 +5476,7 @@ class TelegramAdapter(BasePlatformAdapter):
         doc_name = os.path.splitext(os.path.basename(image_path))[0] + ".jpg" if compressed else os.path.basename(image_path)
 
         async def _photo_failed(e: Exception) -> SendResult:
-            self._log_postgen_candidate_delivery(candidate_row, attached=False)
+            self._log_postgen_candidate_delivery(candidate_row, attached=False, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
             error_str = str(e)
             # Dimension errors are expected for valid images Telegram refuses as photos → INFO.
             if "Photo_invalid_dimensions" in error_str or "PHOTO_INVALID_DIMENSIONS" in error_str:
@@ -5495,7 +5500,7 @@ class TelegramAdapter(BasePlatformAdapter):
             result = await self._send_local_file(
                 "Image", actual_path, chat_id, reply_to, metadata, "photo",
                 lambda f: {"photo": f, "caption": self._caption_1024(caption), **({"reply_markup": reply_markup} if reply_markup else {})}, _photo_failed)
-            self._log_postgen_candidate_delivery(candidate_row, attached=result.success and reply_markup is not None, message_id=result.message_id)
+            self._log_postgen_candidate_delivery(candidate_row, attached=result.success and reply_markup is not None, message_id=result.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
             return result
         finally:
             if compressed:
@@ -5578,17 +5583,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        _delivery_started = time.monotonic()
         reply_markup = self._postgen_candidate_reply_markup(candidate_row)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
-            self._log_postgen_candidate_delivery(candidate_row, attached=False)
+            self._log_postgen_candidate_delivery(
+                candidate_row,
+                attached=False,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
         photo_caption = self._caption_1024(caption)
         try:
             msg = await self._send_media(
                 self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
-            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=msg.message_id)
+            self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=msg.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -5602,7 +5612,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     image_data = resp.content
                 msg = await self._send_media(
                     self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
-                self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=msg.message_id)
+                self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=msg.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)
