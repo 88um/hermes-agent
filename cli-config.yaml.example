@@ -2265,3 +2265,14 @@ updates:
 #   # This runs ONCE per process at startup, so it cannot replace a credential
 #   # that expires mid-session. For a single provider whose token needs
 #   # re-minting during a session, use `providers.<name>.key_cmd` instead.
+
+# Optional Telegram review helper (under platforms.telegram.extra):
+#       review_helper:
+#         # Candidate output may contain only [[review_candidate_id:<short-id>]].
+#         # The executable and args are profile-owned; Hermes never reads them
+#         # from model output and invokes the helper without a shell.
+#         enabled: true
+#         executable: /opt/humorbank/bin/review-helper
+#         args: [--profile, humorbank]
+#         timeout_seconds: 15
+#         note_max_bytes: 4096
