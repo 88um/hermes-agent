@@ -236,6 +236,10 @@ async def _shutdown_abandoned_app(app) -> None:
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     try:
+        from telegram import ForceReply
+    except ImportError:  # pragma: no cover - older python-telegram-bot
+        ForceReply = None
+    try:
         from telegram import LinkPreviewOptions
     except ImportError:
         LinkPreviewOptions = None
@@ -258,6 +262,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    ForceReply = None
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -913,6 +918,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Generic review-helper force-reply prompts. Keys are (chat_id,
+        # prompt_message_id); the helper remains authoritative and this map is
+        # only a fast local binding for replies received before a restart.
+        self._review_note_prompts: Dict[tuple[str, str], Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -5223,12 +5232,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
+            # A resolved generic candidate must use the ordinary Telegram
+            # message path so its inline keyboard travels with the candidate.
+            # Rich messages have a separate Bot API surface that cannot carry
+            # this review markup reliably. Unresolved candidates remain plain
+            # text/rich output, with no buttons attached.
+            review_candidate_id = self._review_candidate_id(metadata)
+            review_candidate_row = None
+            review_candidate_markup = None
+            if review_candidate_id:
+                review_candidate_row = await asyncio.to_thread(
+                    self._resolve_review_candidate, review_candidate_id
+                )
+                review_candidate_markup = self._review_candidate_reply_markup(
+                    review_candidate_row
+                )
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if (
+                review_candidate_markup is None
+                and self._should_attempt_rich(content, metadata=metadata)
+            ):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -5334,6 +5361,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                **(
+                                    {"reply_markup": review_candidate_markup}
+                                    if review_candidate_markup is not None and i == 0
+                                    else {}
+                                ),
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -5348,6 +5380,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    **(
+                                        {"reply_markup": review_candidate_markup}
+                                        if review_candidate_markup is not None and i == 0
+                                        else {}
+                                    ),
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -5507,6 +5544,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self.send_typing(chat_id, metadata=metadata)
                 except Exception:
                     pass  # Typing failures are non-fatal
+
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_candidate_markup is not None,
+                message_id=message_ids[0] if message_ids else None,
+                chat_id=chat_id,
+                media_kind="text",
+            )
 
             return SendResult(
                 success=True,
@@ -7216,6 +7261,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Candidate action failed.")
             return
 
+        # --- Profile-configured review-helper callbacks (rh:...) ---
+        if data.startswith("rh:") or data.startswith("rv:"):
+            await self._handle_review_helper_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -7722,9 +7779,26 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        review_candidate_id = (
+            None
+            if (metadata or {}).get("postgen_candidate")
+            else self._review_candidate_id(metadata)
+        )
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
+        review_markup = self._review_candidate_reply_markup(review_candidate_row)
         
         try:
             if not os.path.exists(audio_path):
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=False,
+                    chat_id=chat_id,
+                    media_kind="audio",
+                )
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
             
             # Compute duration locally — Telegram drops it for long clips
@@ -7783,6 +7857,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     "reply_to_message_id": reply_to_id,
                                     "duration": _duration_secs,
                                     "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                                    **({"reply_markup": review_markup} if review_markup else {}),
                                     **voice_thread_kwargs,
                                     **self._notification_kwargs(metadata),
                                 },
@@ -7833,6 +7908,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "reply_to_message_id": reply_to_id,
                             "duration": _duration_secs,
                             "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                            **({"reply_markup": review_markup} if review_markup else {}),
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -7851,8 +7927,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                chat_id=chat_id,
+                media_kind="audio",
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                chat_id=chat_id,
+                media_kind="audio",
+            )
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
                 self.name,
@@ -8035,6 +8124,534 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, candidate_row.get("id"), exc,
             )
 
+    # ------------------------------------------------------------------
+    # Profile-owned generic review-helper protocol
+    # ------------------------------------------------------------------
+
+    def _review_helper_config(self):
+        """Return the immutable helper config for this profile, if enabled."""
+        from gateway.review_helper import ReviewHelperConfig
+
+        return ReviewHelperConfig.from_config(getattr(self, "config", None))
+
+    def _invoke_review_helper(
+        self, operation: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Invoke the configured helper with a profile-owned executable.
+
+        This is deliberately a tiny adapter boundary: model metadata is
+        reduced to a short candidate id before it reaches this method, and
+        ``ReviewHelperClient`` constructs an argv-only command from config.
+        Any unconfigured or failed helper is represented as a closed result.
+        """
+        from gateway.review_helper import ReviewHelperClient
+
+        config = self._review_helper_config()
+        if config is None:
+            return {"ok": False, "reason": "helper_unconfigured"}
+        try:
+            return ReviewHelperClient(config).invoke(operation, payload)
+        except Exception as exc:
+            logger.warning(
+                "[%s] review_helper_%s_failed: %s",
+                getattr(self, "name", "telegram"), operation, _redact_telegram_error_text(exc),
+            )
+            return {"ok": False, "reason": "helper_unavailable"}
+
+    @staticmethod
+    def _review_result_ok(result: Any) -> bool:
+        return isinstance(result, dict) and result.get("ok") is True
+
+    @staticmethod
+    def _review_result_duplicate(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if result.get("duplicate") is True or result.get("idempotent") is True:
+            return True
+        return str(
+            result.get("reason") or result.get("status") or result.get("error") or ""
+        ).strip().lower() in {
+            "already_recorded",
+            "already_processed",
+            "duplicate",
+            "idempotent",
+        }
+
+    def _review_candidate_id(
+        self, metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        """Read only the short generic candidate id from send metadata."""
+        from gateway.review_helper import valid_candidate_id
+
+        candidate = None
+        if isinstance(metadata, dict):
+            candidate = metadata.get("review_candidate")
+            if candidate is None:
+                candidate = metadata.get("review_candidate_id")
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = candidate.get("id")
+        if not valid_candidate_id(candidate_id):
+            logger.warning(
+                "[%s] review_candidate_directive_invalid: unusable candidate id; "
+                "no buttons attached",
+                getattr(self, "name", "telegram"),
+            )
+            return None
+        return candidate_id
+
+    def _resolve_review_candidate(
+        self, candidate_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an id through the configured helper before rendering UI."""
+        from gateway.review_helper import sanitize_candidate_payload
+
+        if not candidate_id:
+            return None
+        payload = sanitize_candidate_payload({"id": candidate_id})
+        if not payload:
+            return None
+        result = self._invoke_review_helper("resolve", payload)
+        if not self._review_result_ok(result):
+            logger.warning(
+                "[%s] review_candidate_unresolved: id=%s (%s); no buttons attached",
+                getattr(self, "name", "telegram"), candidate_id,
+                result.get("reason") if isinstance(result, dict) else "invalid_response",
+            )
+            return None
+        row = result.get("candidate")
+        if not isinstance(row, dict) or row.get("id") != candidate_id:
+            logger.warning(
+                "[%s] review_candidate_unresolved: id=%s response invalid; "
+                "no buttons attached",
+                getattr(self, "name", "telegram"), candidate_id,
+            )
+            return None
+        return row
+
+    def _review_candidate_reply_markup(
+        self, candidate_row: Optional[Dict[str, Any]]
+    ):
+        """Build the four candidate-level feedback buttons."""
+        from gateway.review_helper import REVIEW_ACTION_TO_CODE, callback_data
+
+        if not isinstance(candidate_row, dict):
+            return None
+        candidate_id = candidate_row.get("id")
+        if not isinstance(candidate_id, str):
+            return None
+        labels = (
+            ("😂 Funny", "funny"),
+            ("😐 Weak", "weak"),
+            ("❌ Bad", "bad"),
+            ("♻️ Repost", "repost"),
+        )
+        buttons = []
+        for label, action in labels:
+            data = callback_data(REVIEW_ACTION_TO_CODE[action], candidate_id)
+            if data is None:
+                return None
+            buttons.append(InlineKeyboardButton(label, callback_data=data))
+        return InlineKeyboardMarkup([buttons])
+
+    def _review_reason_reply_markup(self, candidate_id: str):
+        """Build the diagnostic keyboard shown after Weak or Bad."""
+        from gateway.review_helper import (
+            REVIEW_REASON_LABELS,
+            REVIEW_REASON_TO_CODE,
+            callback_data,
+        )
+
+        # Two columns keep the keyboard usable while retaining the exact
+        # taxonomy in the callback's stable reason code.
+        reason_order = (
+            "bad_news_peg",
+            "wrong_card_retrieval",
+            "wrong_subject_archetype_context",
+            "mechanism_lost",
+            "unsupported_slot_fact",
+            "awkward_deterministic_render",
+            "source_joke_weak",
+            "other_add_note",
+        )
+        rows = []
+        for index in range(0, len(reason_order), 2):
+            row = []
+            for reason in reason_order[index:index + 2]:
+                data = callback_data(
+                    "reason", candidate_id, REVIEW_REASON_TO_CODE[reason]
+                )
+                if data is None:
+                    return None
+                row.append(
+                    InlineKeyboardButton(
+                        REVIEW_REASON_LABELS[reason], callback_data=data
+                    )
+                )
+            rows.append(row)
+        return InlineKeyboardMarkup(rows)
+
+    def _log_review_candidate_delivery(
+        self,
+        candidate_row: Optional[Dict[str, Any]],
+        attached: bool,
+        message_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        chat_id: Optional[str] = None,
+        *,
+        media_kind: Optional[str] = None,
+    ) -> None:
+        """Append a delivery event after a Telegram send is confirmed."""
+        if not isinstance(candidate_row, dict) or not candidate_row.get("id"):
+            return
+        payload: Dict[str, Any] = {
+            "event_type": "delivery",
+            "event": "delivery",
+            "candidate_id": str(candidate_row["id"]),
+            "buttons_attached": bool(attached),
+        }
+        if chat_id is not None:
+            payload["chat_id"] = str(chat_id)
+        if message_id is not None:
+            payload["message_id"] = str(message_id)
+        if duration_ms is not None:
+            payload["duration_ms"] = int(duration_ms)
+        if media_kind:
+            payload["media_kind"] = media_kind
+        result = self._invoke_review_helper("event", payload)
+        if not self._review_result_ok(result) and not self._review_result_duplicate(result):
+            logger.warning(
+                "[%s] review_candidate_delivery_log_failed: id=%s (%s)",
+                getattr(self, "name", "telegram"), candidate_row.get("id"),
+                result.get("reason") if isinstance(result, dict) else "invalid_response",
+            )
+
+    def _review_actor_id(self, query: Any) -> str:
+        return str(getattr(getattr(query, "from_user", None), "id", "telegram"))
+
+    @staticmethod
+    def _review_callback_parts(data: str):
+        """Parse both current ``rh`` and draft ``rv`` callback spellings."""
+        if not isinstance(data, str):
+            return None
+        parts = data.split(":")
+        if len(parts) < 3 or parts[0] not in {"rh", "rv"}:
+            return None
+        kind = parts[1]
+        candidate_id = parts[2]
+        if kind in {"f", "w", "b", "r"} and len(parts) == 3:
+            return {"kind": "action", "code": kind, "candidate_id": candidate_id}
+        if kind in {"reason", "q"} and len(parts) == 4:
+            return {
+                "kind": "reason",
+                "code": parts[3],
+                "candidate_id": candidate_id,
+            }
+        if kind in {"note", "n"} and len(parts) == 3:
+            return {"kind": "note", "candidate_id": candidate_id}
+        return None
+
+    async def _handle_review_helper_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any = None,
+        query_chat_type: Any = None,
+        query_thread_id: Any = None,
+        query_user_name: Any = None,
+    ) -> None:
+        """Handle generic candidate feedback with auth and helper checks."""
+        from gateway.review_helper import REVIEW_ACTION_CODES, reason_from_code
+
+        parsed = self._review_callback_parts(data)
+        if parsed is None:
+            await query.answer(text="Invalid candidate feedback.")
+            return
+        candidate_id = parsed["candidate_id"]
+        if not self._review_candidate_id({"review_candidate": {"id": candidate_id}}):
+            await query.answer(text="Invalid candidate feedback.")
+            return
+
+        caller_id = self._review_actor_id(query)
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to review this candidate.")
+            return
+
+        # Resolve on every callback.  This prevents an old button from acting
+        # on an expired, already-finalized, or otherwise unbound candidate.
+        candidate_row = await asyncio.to_thread(
+            self._resolve_review_candidate, candidate_id
+        )
+        if candidate_row is None:
+            await query.answer(text="This candidate is unavailable.")
+            return
+
+        message = getattr(query, "message", None)
+        message_id = getattr(message, "message_id", None)
+        chat_id = query_chat_id if query_chat_id is not None else getattr(message, "chat_id", None)
+        base_payload: Dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "event_type": "feedback",
+            "event": "verdict",
+            "actor": caller_id,
+            "chat_id": str(chat_id) if chat_id is not None else None,
+            "message_id": str(message_id) if message_id is not None else None,
+        }
+
+        if parsed["kind"] == "action":
+            action = REVIEW_ACTION_CODES.get(parsed["code"])
+            if action is None:
+                await query.answer(text="Invalid candidate feedback.")
+                return
+            result = await asyncio.to_thread(
+                self._invoke_review_helper,
+                "event",
+                {**base_payload, "verdict": action, "action": action},
+            )
+            if not self._review_result_ok(result):
+                if self._review_result_duplicate(result):
+                    await query.answer(text="Already recorded.")
+                else:
+                    await query.answer(text="Candidate feedback unavailable.")
+                return
+            if action in {"weak", "bad"}:
+                markup = self._review_reason_reply_markup(candidate_id)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=markup)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            await query.answer(text=f"{action.capitalize()} recorded.")
+            return
+
+        if parsed["kind"] == "reason":
+            reason = reason_from_code(parsed["code"])
+            if reason is None:
+                await query.answer(text="Invalid feedback reason.")
+                return
+            result = await asyncio.to_thread(
+                self._invoke_review_helper,
+                "event",
+                {
+                    **base_payload,
+                    "event_type": "reason",
+                    "event": "reason",
+                    "reason": reason,
+                },
+            )
+            if not self._review_result_ok(result):
+                await query.answer(
+                    text="Already recorded." if self._review_result_duplicate(result)
+                    else "Candidate feedback unavailable."
+                )
+                return
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await query.answer(text="Reason recorded.")
+            if reason == "other_add_note":
+                await self._send_review_note_prompt(
+                    query,
+                    candidate_id=candidate_id,
+                    candidate_message_id=message_id,
+                    chat_id=chat_id,
+                    chat_type=query_chat_type,
+                    thread_id=query_thread_id,
+                    actor=caller_id,
+                )
+            return
+
+        # ``note`` is accepted for forwards compatibility, but an incoming
+        # note is only consumed through a Telegram reply to a bound prompt.
+        await query.answer(text="Reply to the note prompt to add feedback.")
+
+    def _review_note_prompt_text(self, candidate_id: str) -> str:
+        # Keep the id out of the user-visible prompt; helper binding is the
+        # authoritative association and the callback id is never user input.
+        return "📝 Reply to this message with a review note for the candidate."
+
+    async def _send_review_note_prompt(
+        self,
+        query: Any,
+        *,
+        candidate_id: str,
+        candidate_message_id: Any,
+        chat_id: Any,
+        chat_type: Any,
+        thread_id: Any,
+        actor: str,
+    ) -> None:
+        """Send and bind a force-reply note prompt after ``other/add note``."""
+        bot = getattr(self, "_bot", None)
+        if bot is None or chat_id is None:
+            return
+        prompt_markup = None
+        if ForceReply is not None:
+            try:
+                prompt_markup = ForceReply(selective=True)
+            except TypeError:
+                prompt_markup = ForceReply()
+        reply_to_id = None
+        try:
+            reply_to_id = int(candidate_message_id) if candidate_message_id is not None else None
+        except (TypeError, ValueError):
+            reply_to_id = None
+        thread_kwargs = self._thread_kwargs_for_send(
+            str(chat_id),
+            str(thread_id) if thread_id is not None else None,
+            None,
+            reply_to_message_id=reply_to_id,
+            reply_to_mode=getattr(self, "_reply_to_mode", "first"),
+        )
+        send_kwargs: Dict[str, Any] = {
+            "chat_id": normalize_telegram_chat_id(str(chat_id)),
+            "text": self._review_note_prompt_text(candidate_id),
+            "reply_to_message_id": reply_to_id,
+            **thread_kwargs,
+            **self._notification_kwargs({"notify": True}),
+        }
+        if prompt_markup is not None:
+            send_kwargs["reply_markup"] = prompt_markup
+        try:
+            prompt = await bot.send_message(**send_kwargs)
+        except Exception as exc:
+            logger.warning(
+                "[%s] review_note_prompt_send_failed: %s",
+                getattr(self, "name", "telegram"), _redact_telegram_error_text(exc),
+            )
+            return
+        prompt_id = getattr(prompt, "message_id", None)
+        if prompt_id is None:
+            return
+        result = await asyncio.to_thread(
+            self._invoke_review_helper,
+            "event",
+            {
+                "event_type": "note_prompt",
+                "event": "note_prompt",
+                "candidate_id": candidate_id,
+                "prompt_message_id": str(prompt_id),
+                "candidate_message_id": str(candidate_message_id) if candidate_message_id is not None else None,
+                "chat_id": str(chat_id),
+                "actor": actor,
+            },
+        )
+        if not self._review_result_ok(result) and not self._review_result_duplicate(result):
+            try:
+                delete_message = getattr(bot, "delete_message", None)
+                if callable(delete_message):
+                    await delete_message(
+                        chat_id=normalize_telegram_chat_id(str(chat_id)),
+                        message_id=int(prompt_id),
+                    )
+            except Exception:
+                pass
+            return
+        prompts = getattr(self, "_review_note_prompts", None)
+        if prompts is None:
+            prompts = {}
+            self._review_note_prompts = prompts
+        prompts[(str(chat_id), str(prompt_id))] = {
+            "candidate_id": candidate_id,
+            "candidate_message_id": str(candidate_message_id) if candidate_message_id is not None else None,
+            "actor": actor,
+        }
+
+    @staticmethod
+    def _bound_review_note(note: Any, max_bytes: int) -> str:
+        """Bound a note in UTF-8 bytes while preserving its original prefix."""
+        from gateway.review_helper import DEFAULT_REVIEW_NOTE_MAX_BYTES
+
+        if not isinstance(note, str):
+            return ""
+        try:
+            limit = max(1, int(max_bytes))
+        except (TypeError, ValueError):
+            limit = DEFAULT_REVIEW_NOTE_MAX_BYTES
+        encoded = note.encode("utf-8")
+        if len(encoded) <= limit:
+            return note
+        return encoded[:limit].decode("utf-8", "ignore")
+
+    async def _maybe_handle_review_note_reply(self, message: Message) -> bool:
+        """Consume replies to review prompts without entering the agent path."""
+        reply = getattr(message, "reply_to_message", None)
+        target_id = getattr(reply, "message_id", None)
+        if target_id is None:
+            return False
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        key = (str(chat_id), str(target_id))
+        prompts = getattr(self, "_review_note_prompts", {}) or {}
+        binding = prompts.get(key)
+        target_text = str(
+            getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+        )
+        # After a restart the local map is empty.  Only consume a reply to the
+        # exact review prompt wording; arbitrary replies remain conversational.
+        if binding is None and not target_text.startswith("📝 Reply to this message with a review note"):
+            return False
+        config = self._review_helper_config()
+        max_bytes = (
+            getattr(config, "note_max_bytes", 4096) if config is not None else 4096
+        )
+        note = self._bound_review_note(getattr(message, "text", ""), max_bytes)
+        user = getattr(message, "from_user", None)
+        actor = str(getattr(user, "id", "telegram"))
+        chat_type = getattr(chat, "type", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        user_name = (
+            getattr(user, "username", None)
+            or getattr(user, "first_name", None)
+            or getattr(user, "full_name", None)
+        )
+        # The regular intake check intentionally permits unknown DMs so the
+        # gateway can offer pairing. Review notes are a gated mutation, so
+        # require the stricter callback authorization as well.
+        if not self._is_callback_user_authorized(
+            actor,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=str(user_name) if user_name else None,
+        ):
+            return True
+        payload: Dict[str, Any] = {
+            "event_type": "note",
+            "event": "note",
+            "prompt_message_id": str(target_id),
+            "reply_message_id": str(getattr(message, "message_id", "")),
+            "chat_id": str(chat_id),
+            "actor": actor,
+            "note": note,
+        }
+        if isinstance(binding, dict) and binding.get("candidate_id"):
+            payload["candidate_id"] = binding["candidate_id"]
+        result = await asyncio.to_thread(self._invoke_review_helper, "note", payload)
+        if self._review_result_ok(result) or self._review_result_duplicate(result):
+            prompts.pop(key, None)
+        else:
+            # Consume the update even on rejection so stale/unauthorized text
+            # cannot fall through into a user conversation. Keep an in-memory
+            # binding only for transient helper outages where a later reply may
+            # be useful; the helper remains the source of truth.
+            reason = str(result.get("reason") or "") if isinstance(result, dict) else ""
+            if reason in {"expired", "unknown", "unbound", "unauthorized", "already_recorded"}:
+                prompts.pop(key, None)
+        return True
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -8092,7 +8709,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # When a PostgenBot candidate directive accompanies a single image,
         # route it through the one-photo path so the inline keyboard is attached
         # directly to the candidate image.
-        if (metadata or {}).get("postgen_candidate") and len(photos) == 1:
+        if (
+            ((metadata or {}).get("postgen_candidate")
+             or (metadata or {}).get("review_candidate")
+             or (metadata or {}).get("review_candidate_id"))
+            and len(photos) == 1
+        ):
             image_url, alt_text = photos[0]
             caption = alt_text[:1024] if alt_text else None
             if image_url.startswith("file://"):
@@ -8210,6 +8832,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        review_candidate_id = None if candidate_id else self._review_candidate_id(metadata)
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
         _delivery_started = time.monotonic()
         try:
             if not os.path.exists(image_path):
@@ -8217,6 +8844,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     candidate_row,
                     attached=False,
                     duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                )
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                    chat_id=chat_id,
+                    media_kind="photo",
                 )
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
 
@@ -8230,6 +8864,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
             reply_markup = self._postgen_candidate_reply_markup(candidate_row)
+            if reply_markup is None:
+                reply_markup = self._review_candidate_reply_markup(review_candidate_row)
             with open(image_path, "rb") as image_file:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_photo,
@@ -8257,6 +8893,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id=getattr(msg, "message_id", None),
                 duration_ms=int((time.monotonic() - _delivery_started) * 1000),
             )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=reply_markup is not None and candidate_row is None,
+                message_id=getattr(msg, "message_id", None),
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                chat_id=chat_id,
+                media_kind="photo",
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             if 'candidate_row' in locals() and candidate_row is not None:
@@ -8265,6 +8909,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     attached=False,
                     duration_ms=int((time.monotonic() - _delivery_started) * 1000),
                 )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                chat_id=chat_id,
+                media_kind="photo",
+            )
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
             # files that Telegram just refuses as photos (screenshots, extreme
@@ -8328,8 +8979,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        review_candidate_id = (
+            None
+            if (metadata or {}).get("postgen_candidate")
+            else self._review_candidate_id(metadata)
+        )
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
+        review_markup = self._review_candidate_reply_markup(review_candidate_row)
         try:
             if not os.path.exists(file_path):
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=False,
+                    chat_id=chat_id,
+                    media_kind="document",
+                )
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
 
             display_name = file_name or os.path.basename(file_path)
@@ -8353,6 +9020,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        **({"reply_markup": review_markup} if review_markup else {}),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -8361,8 +9029,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     "document",
                     reset_media=lambda: f.seek(0),
                 )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                chat_id=chat_id,
+                media_kind="document",
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                chat_id=chat_id,
+                media_kind="document",
+            )
             logger.warning(
                 "[%s] Failed to send document: %s",
                 self.name, _redact_telegram_error_text(e),
@@ -8382,8 +9063,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        review_candidate_id = (
+            None
+            if (metadata or {}).get("postgen_candidate")
+            else self._review_candidate_id(metadata)
+        )
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
+        review_markup = self._review_candidate_reply_markup(review_candidate_row)
         try:
             if not os.path.exists(video_path):
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=False,
+                    chat_id=chat_id,
+                    media_kind="video",
+                )
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
 
             _thread = self._metadata_thread_id(metadata)
@@ -8404,6 +9101,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
                         "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        **({"reply_markup": review_markup} if review_markup else {}),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
@@ -8412,8 +9110,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     "video",
                     reset_media=lambda: f.seek(0),
                 )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                chat_id=chat_id,
+                media_kind="video",
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                chat_id=chat_id,
+                media_kind="video",
+            )
             logger.warning(
                 "[%s] Failed to send video: %s",
                 self.name, _redact_telegram_error_text(e),
@@ -8438,8 +9149,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         candidate_id = self._postgen_candidate_id(metadata)
         candidate_row = self._resolve_postgen_candidate(candidate_id) if candidate_id else None
+        review_candidate_id = None if candidate_id else self._review_candidate_id(metadata)
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
         _delivery_started = time.monotonic()
         reply_markup = self._postgen_candidate_reply_markup(candidate_row)
+        if reply_markup is None:
+            reply_markup = self._review_candidate_reply_markup(review_candidate_row)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
@@ -8447,6 +9165,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 candidate_row,
                 attached=False,
                 duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                chat_id=chat_id,
+                media_kind="photo",
             )
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
@@ -8484,6 +9209,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 attached=reply_markup is not None,
                 message_id=getattr(msg, "message_id", None),
                 duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=reply_markup is not None and candidate_row is None,
+                message_id=getattr(msg, "message_id", None),
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                chat_id=chat_id,
+                media_kind="photo",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -8535,6 +9268,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=getattr(msg, "message_id", None),
                     duration_ms=int((time.monotonic() - _delivery_started) * 1000),
                 )
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=reply_markup is not None and candidate_row is None,
+                    message_id=getattr(msg, "message_id", None),
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                    chat_id=chat_id,
+                    media_kind="photo",
+                )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
                 if candidate_row is not None:
@@ -8543,6 +9284,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         attached=False,
                         duration_ms=int((time.monotonic() - _delivery_started) * 1000),
                     )
+                self._log_review_candidate_delivery(
+                    review_candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+                    chat_id=chat_id,
+                    media_kind="photo",
+                )
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
                     self.name,
@@ -8563,6 +9311,17 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        review_candidate_id = (
+            None
+            if (metadata or {}).get("postgen_candidate")
+            else self._review_candidate_id(metadata)
+        )
+        review_candidate_row = (
+            await asyncio.to_thread(self._resolve_review_candidate, review_candidate_id)
+            if review_candidate_id else None
+        )
+        review_markup = self._review_candidate_reply_markup(review_candidate_row)
         
         try:
             _anim_thread = self._metadata_thread_id(metadata)
@@ -8582,6 +9341,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "caption": caption[:1024] if caption else None,
                     "reply_to_message_id": reply_to_id,
                     "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                    **({"reply_markup": review_markup} if review_markup else {}),
                     **animation_thread_kwargs,
                     **self._notification_kwargs(metadata),
                 },
@@ -8589,8 +9349,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_id,
                 "animation",
             )
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_markup is not None,
+                message_id=getattr(msg, "message_id", None),
+                chat_id=chat_id,
+                media_kind="animation",
+            )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            self._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=False,
+                chat_id=chat_id,
+                media_kind="animation",
+            )
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
                 self.name,
@@ -9936,6 +10709,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        # A force-reply to a review prompt is feedback, never a conversational
+        # turn. Run this before mention/batching gates so bound notes are
+        # consumed even in a group where the user did not mention the bot.
+        if await self._maybe_handle_review_note_reply(msg):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -11180,6 +11958,14 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
 
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])
+
+    # Review-helper identity is profile behavior, never a process environment
+    # value. Preserve a top-level Telegram shorthand alongside the preferred
+    # ``telegram.extra.review_helper`` form so multiplexed profiles retain
+    # independent executables and static arguments.
+    for _review_key in ("review_helper", "review_helper_config"):
+        if _review_key in telegram_cfg:
+            extras.setdefault(_review_key, telegram_cfg[_review_key])
 
     _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
     if _effective_rm is not None and not os.getenv("TELEGRAM_REQUIRE_MENTION"):

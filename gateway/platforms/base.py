@@ -5140,6 +5140,21 @@ class BasePlatformAdapter(ABC):
         return candidate, cleaned
 
     @staticmethod
+    def extract_review_candidate_metadata(content: str) -> Tuple[Optional[dict], str]:
+        """Extract and strip a profile-configured review-helper marker.
+
+        Generic review candidates carry only a short id in model-visible
+        output.  The configured helper owns the candidate snapshot and all
+        feedback state; paths and executable details never cross this parser.
+        Postgen's ``extract_postgen_candidate_metadata`` remains a separate
+        compatibility API so its marker behavior and warning text stay
+        byte-for-byte unchanged.
+        """
+        from gateway.review_helper import extract_review_candidate_metadata
+
+        return extract_review_candidate_metadata(content)
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native delivery.
@@ -6445,6 +6460,7 @@ class BasePlatformAdapter(ABC):
                 # MEDIA: tags. Strip it before user-visible delivery, then pass
                 # it through send metadata so Telegram can attach inline buttons.
                 _postgen_candidate, response = self.extract_postgen_candidate_metadata(response)
+                _review_candidate, response = self.extract_review_candidate_metadata(response)
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
@@ -6522,6 +6538,9 @@ class BasePlatformAdapter(ABC):
                 if _postgen_candidate:
                     _final_thread_metadata = dict(_final_thread_metadata or {})
                     _final_thread_metadata["postgen_candidate"] = _postgen_candidate
+                if _review_candidate:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["review_candidate"] = _review_candidate
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

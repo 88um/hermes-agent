@@ -22421,6 +22421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
             _postgen_candidate, response = BasePlatformAdapter.extract_postgen_candidate_metadata(response)
+            _review_candidate, response = BasePlatformAdapter.extract_review_candidate_metadata(response)
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -22449,6 +22450,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _postgen_candidate:
                 _thread_meta = dict(_thread_meta or {})
                 _thread_meta["postgen_candidate"] = _postgen_candidate
+            if _review_candidate:
+                _thread_meta = dict(_thread_meta or {})
+                _thread_meta["review_candidate"] = _review_candidate
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
