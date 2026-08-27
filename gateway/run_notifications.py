@@ -351,6 +351,7 @@ class GatewayNotificationsMixin:
             force_document_attachments = "[[as_document]]" in response
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
             _postgen_candidate, response = BasePlatformAdapter.extract_postgen_candidate_metadata(response)
+            _review_candidate, response = BasePlatformAdapter.extract_review_candidate_metadata(response)
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
@@ -370,6 +371,9 @@ class GatewayNotificationsMixin:
             if _postgen_candidate:
                 _thread_meta = dict(_thread_meta or {})
                 _thread_meta["postgen_candidate"] = _postgen_candidate
+            if _review_candidate:
+                _thread_meta = dict(_thread_meta or {})
+                _thread_meta["review_candidate"] = _review_candidate
             chat_id = event.source.chat_id
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
             def _is_photo(media_path: str, is_voice: bool) -> bool:

@@ -3279,6 +3279,21 @@ class BasePlatformAdapter(ABC):
         return candidate, cleaned
 
     @staticmethod
+    def extract_review_candidate_metadata(content: str) -> Tuple[Optional[dict], str]:
+        """Extract and strip a profile-configured review-helper marker.
+
+        Generic review candidates carry only a short id in model-visible
+        output.  The configured helper owns the candidate snapshot and all
+        feedback state; paths and executable details never cross this parser.
+        Postgen's ``extract_postgen_candidate_metadata`` remains a separate
+        compatibility API so its marker behavior and warning text stay
+        byte-for-byte unchanged.
+        """
+        from gateway.review_helper import extract_review_candidate_metadata
+
+        return extract_review_candidate_metadata(content)
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """Bare local file paths (absolute, ``~/`` or drive-letter) with deliverable extensions ->
         ``(expanded_paths, cleaned_text)``. Candidates must exist on disk (URLs / hallucinated paths
@@ -4459,6 +4474,7 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
                 _postgen_candidate, response = self.extract_postgen_candidate_metadata(response)
+                _review_candidate, response = self.extract_review_candidate_metadata(response)
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
@@ -4467,6 +4483,9 @@ class BasePlatformAdapter(ABC):
                 if _postgen_candidate:
                     _final_thread_metadata = dict(_final_thread_metadata or {})
                     _final_thread_metadata["postgen_candidate"] = _postgen_candidate
+                if _review_candidate:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["review_candidate"] = _review_candidate
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
