@@ -371,6 +371,18 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    # The gateway stream path already turns this bounded marker into trusted
+    # adapter metadata.  Standalone ``hermes send`` must do the same or a
+    # scheduled candidate becomes plain text with no review keyboard.  Keep
+    # this Telegram-only: the generic helper currently defines Telegram
+    # callback semantics, and other transports should receive their content
+    # unchanged.
+    review_candidate = None
+    if target.split(":", 1)[0].strip().lower() == "telegram":
+        from gateway.review_helper import extract_review_candidate_metadata
+
+        review_candidate, message = extract_review_candidate_metadata(message)
+
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
     from tools.send_message_tool import send_message_tool
@@ -385,6 +397,8 @@ def cmd_send(args: argparse.Namespace) -> None:
         "target": target,
         "message": message,
     }
+    if review_candidate is not None:
+        tool_args["review_candidate"] = review_candidate
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(

@@ -385,6 +385,136 @@ class TestSendMessageTool:
 
 
 class TestSendTelegramMediaDelivery:
+    def test_review_candidate_attaches_four_buttons_and_logs_delivery(
+        self, monkeypatch
+    ):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=17))
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        import plugins.platforms.telegram.adapter as telegram_adapter_module
+
+        class InlineKeyboardButton:
+            def __init__(self, text, callback_data=None):
+                self.text = text
+                self.callback_data = callback_data
+
+        class InlineKeyboardMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+
+        monkeypatch.setattr(
+            telegram_adapter_module, "InlineKeyboardButton", InlineKeyboardButton
+        )
+        monkeypatch.setattr(
+            telegram_adapter_module, "InlineKeyboardMarkup", InlineKeyboardMarkup
+        )
+
+        candidate = {"id": "candidate_123", "status": "pending", "lane": "exact"}
+        delivery = []
+        monkeypatch.setattr(
+            TelegramAdapter,
+            "_resolve_review_candidate",
+            lambda self, candidate_id: candidate,
+        )
+        monkeypatch.setattr(
+            TelegramAdapter,
+            "_log_review_candidate_delivery",
+            lambda self, *args, **kwargs: delivery.append((args, kwargs)),
+        )
+        pconfig = SimpleNamespace(enabled=True, token="token", extra={})
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "Candidate text",
+                platform_config=pconfig,
+                review_candidate={"id": "candidate_123"},
+            )
+        )
+
+        assert result.get("success") is True, result
+        markup = bot.send_message.await_args.kwargs["reply_markup"]
+        buttons = markup.inline_keyboard[0]
+        assert [button.text for button in buttons] == [
+            "😂 Funny",
+            "😐 Weak",
+            "❌ Bad",
+            "♻️ Repost",
+        ]
+        assert [button.callback_data for button in buttons] == [
+            "rh:f:candidate_123",
+            "rh:w:candidate_123",
+            "rh:b:candidate_123",
+            "rh:r:candidate_123",
+        ]
+        assert delivery and delivery[0][1]["attached"] is True
+        assert delivery[0][1]["message_id"] == "17"
+
+    def test_chunked_review_candidate_returns_keyboard_message_id(
+        self, monkeypatch
+    ):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=[
+                SimpleNamespace(message_id=17),
+                SimpleNamespace(message_id=18),
+            ]
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        import plugins.platforms.telegram.adapter as telegram_adapter_module
+
+        class InlineKeyboardButton:
+            def __init__(self, text, callback_data=None):
+                self.text = text
+                self.callback_data = callback_data
+
+        class InlineKeyboardMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+
+        monkeypatch.setattr(
+            telegram_adapter_module, "InlineKeyboardButton", InlineKeyboardButton
+        )
+        monkeypatch.setattr(
+            telegram_adapter_module, "InlineKeyboardMarkup", InlineKeyboardMarkup
+        )
+        candidate = {"id": "candidate_123", "status": "pending", "lane": "exact"}
+        monkeypatch.setattr(
+            TelegramAdapter,
+            "_resolve_review_candidate",
+            lambda self, candidate_id: candidate,
+        )
+        monkeypatch.setattr(
+            TelegramAdapter,
+            "_log_review_candidate_delivery",
+            lambda self, *args, **kwargs: None,
+        )
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "source " * 1000,
+                platform_config=SimpleNamespace(enabled=True, token="token", extra={}),
+                review_candidate={"id": "candidate_123"},
+            )
+        )
+
+        assert bot.send_message.await_count == 2
+        assert "reply_markup" in bot.send_message.await_args_list[0].kwargs
+        assert "reply_markup" not in bot.send_message.await_args_list[1].kwargs
+        assert result["message_id"] == "17"
+
     def test_sends_photo_with_caption_for_media_tag(self, tmp_path, monkeypatch):
         # A single captionable image + short text now rides as the photo's
         # native caption (MEDIA:<path> caption), not a separate text message.

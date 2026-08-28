@@ -66,6 +66,11 @@ keyboard with `😂 Funny`, `😐 Weak`, `❌ Bad`, and `♻️ Repost`. Callbac
 the bounded `rh:<action>:<id>` form and remains at or below Telegram's 64-byte
 limit.
 
+Both normal gateway replies and one-shot `hermes send` Telegram deliveries
+extract the marker into trusted metadata before sending. The standalone path
+uses the active profile's configured helper, attaches the same keyboard, and
+records the same delivery event without starting a second gateway poller.
+
 Weak and Bad append the verdict first, then replace the keyboard with the
 diagnostic reasons: bad news peg; wrong card/retrieval; wrong subject,
 archetype, or context; mechanism lost; unsupported slot/fact; awkward

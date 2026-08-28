@@ -410,6 +410,12 @@ For bot-token platforms (Telegram, Discord, Slack, Signal, SMS, WhatsApp-CloudAP
 | `-q`, `--quiet` | Suppress stdout on success — useful in scripts (rely on exit code only). |
 | `--json` | Emit raw JSON result instead of human-readable output. |
 
+For a Telegram profile with `platforms.telegram.extra.review_helper`
+configured, a body containing `[[review_candidate_id:<short-id>]]` is resolved
+through that profile-owned helper. `hermes send` removes the marker, attaches
+the standard Funny/Weak/Bad/Repost keyboard, and records the delivery event.
+Malformed or unresolved candidate IDs fail closed with no keyboard.
+
 If neither a positional `message` argument nor `--file` is provided, `hermes send` reads from stdin when it is not a TTY. Exit codes: `0` on success, `1` on delivery/backend failure, `2` on usage errors.
 
 ### Sending images and other media

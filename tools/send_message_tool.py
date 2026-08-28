@@ -488,6 +488,12 @@ def _handle_send(args):
             "media_files": media_files,
             "force_document": force_document_attachments,
         }
+        if platform == Platform.TELEGRAM and args.get("review_candidate") is not None:
+            from gateway.review_helper import sanitize_candidate_payload
+
+            review_candidate = sanitize_candidate_payload(args.get("review_candidate"))
+            if review_candidate:
+                send_kwargs["review_candidate"] = review_candidate
         # Preserve the exact built-in call contract; only custom handlers need
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
@@ -922,7 +928,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    args=None,
+    review_candidate=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1004,6 +1020,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            platform_config=pconfig,
+            review_candidate=review_candidate,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1331,7 +1349,17 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    platform_config=None,
+    review_candidate=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1342,6 +1370,31 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
+
+        review_adapter = None
+        review_candidate_row = None
+        review_candidate_markup = None
+        if review_candidate and platform_config is not None:
+            from gateway.config import Platform
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+
+            # The standalone path intentionally does not connect an adapter or
+            # start polling.  These review-helper methods need only the active
+            # immutable profile config, and reuse the exact resolver, keyboard,
+            # and delivery-event behavior used by the running gateway.
+            review_adapter = object.__new__(TelegramAdapter)
+            review_adapter.config = platform_config
+            review_adapter.platform = Platform.TELEGRAM
+            review_candidate_id = review_adapter._review_candidate_id(
+                {"review_candidate": review_candidate}
+            )
+            if review_candidate_id:
+                review_candidate_row = await asyncio.to_thread(
+                    review_adapter._resolve_review_candidate, review_candidate_id
+                )
+                review_candidate_markup = review_adapter._review_candidate_reply_markup(
+                    review_candidate_row
+                )
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
         # Inspired by github.com/ashaney — PR #1568.
@@ -1424,6 +1477,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_kwargs["disable_web_page_preview"] = True
 
         last_msg = None
+        review_message_id = None
         warnings = []
 
         # MEDIA:<path> caption: when a single captionable file is accompanied
@@ -1455,29 +1509,43 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             text_chunks = BasePlatformAdapter.truncate_message(
                 formatted, 4096, len_fn=utf16_len
             )
-            for chunk in text_chunks:
+            for chunk_index, chunk in enumerate(text_chunks):
+                chunk_kwargs = dict(text_kwargs)
+                if review_candidate_markup is not None and chunk_index == 0:
+                    chunk_kwargs["reply_markup"] = review_candidate_markup
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode, **chunk_kwargs
                     )
+                    if review_message_id is None:
+                        review_message_id = str(last_msg.message_id)
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
                     # message still delivers (matching the gateway adapter's
                     # fallback behaviour, issue #27012).
-                    if _is_telegram_thread_not_found(md_error) and text_kwargs.get("message_thread_id") is not None:
+                    if (
+                        _is_telegram_thread_not_found(md_error)
+                        and chunk_kwargs.get("message_thread_id") is not None
+                    ):
                         logger.warning(
                             "Thread %s not found in _send_telegram, retrying without message_thread_id",
-                            text_kwargs.get("message_thread_id"),
+                            chunk_kwargs.get("message_thread_id"),
                         )
                         text_kwargs.pop("message_thread_id", None)
+                        chunk_kwargs.pop("message_thread_id", None)
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode, **chunk_kwargs
                         )
-                    elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
+                        if review_message_id is None:
+                            review_message_id = str(last_msg.message_id)
+                    elif any(
+                        marker in str(md_error).lower()
+                        for marker in ("parse", "markdown", "html")
+                    ):
                         logger.warning(
                             "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                             send_parse_mode,
@@ -1494,8 +1562,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None, **chunk_kwargs
                         )
+                        if review_message_id is None:
+                            review_message_id = str(last_msg.message_id)
                     else:
                         raise
 
@@ -1636,11 +1706,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
+        if review_adapter is not None and review_candidate_row is not None:
+            review_adapter._log_review_candidate_delivery(
+                review_candidate_row,
+                attached=review_candidate_markup is not None,
+                message_id=review_message_id or str(last_msg.message_id),
+                chat_id=chat_id,
+                media_kind="text" if review_message_id is not None else "media",
+            )
+
         result = {
             "success": True,
             "platform": "telegram",
             "chat_id": chat_id,
-            "message_id": str(last_msg.message_id),
+            # Candidate controls live on the first text chunk. Return that
+            # message id so the caller's delivery manifest and the helper's
+            # callback binding point at the same Telegram message.
+            "message_id": review_message_id or str(last_msg.message_id),
         }
         if warnings:
             result["warnings"] = warnings
