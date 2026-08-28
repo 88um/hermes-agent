@@ -267,6 +267,11 @@ def _handle_send(args):
         # Only custom plugin handlers receive the complete typed request. ``mentions`` is a WhatsApp-only
         # contract (the CLI rejects it elsewhere); other platforms' standalone senders don't accept the kwarg.
         handler_args = {"args": args} if entry is not None and entry.send_message_handler is not None else {}
+        if platform_name == "telegram" and args.get("review_candidate") is not None:
+            from gateway.review_helper import sanitize_candidate_payload
+            candidate = sanitize_candidate_payload(args["review_candidate"])
+            if candidate:
+                handler_args["review_candidate"] = candidate
         mentions = args.get("mentions")
         if mentions and platform_name == "whatsapp":
             handler_args["mentions"] = [mentions] if isinstance(mentions, str) else list(mentions)
@@ -685,7 +690,7 @@ _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, fei
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None):
+                            force_document=False, mentions=None, args=None, review_candidate=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -698,6 +703,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.TELEGRAM:
         return await _send_telegram(
             pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
+            platform_config=pconfig, review_candidate=review_candidate,
             disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")))
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)

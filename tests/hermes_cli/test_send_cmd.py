@@ -538,3 +538,30 @@ def test_empty_list_hint_names_default_root_directory_under_profile_home(tmp_pat
     assert f"channel discovery can populate {profile / 'channel_directory.json'}." in out
     assert f"A gateway running from {root} already has {root / 'channel_directory.json'}" in out
     assert f"scoped to profile home {profile}" in out
+
+def test_review_candidate_marker_becomes_metadata_and_is_not_delivered(
+    fake_tool, capsys, monkeypatch
+):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    args = _parse(
+        [
+            "--to",
+            "telegram:123",
+            "Candidate text\n[[review_candidate_id:candidate_123]]",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [
+        {
+            "action": "send",
+            "target": "telegram:123",
+            "message": "Candidate text",
+            "review_candidate": {"id": "candidate_123"},
+        }
+    ]
+    assert "review_candidate_id" not in capsys.readouterr().out
+
