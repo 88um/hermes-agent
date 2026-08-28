@@ -188,7 +188,7 @@ async def _telegram_send_text_chunk(bot, chat_id, chunk, parse_mode, has_html, t
 
 
 async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, caption, parse_mode, has_html,
-                                   thread_kwargs, force_document):
+                                   thread_kwargs, force_document, reply_markup=None):
     """Upload one file with adapter-matching fallbacks (thread-not-found -> no
     ``message_thread_id``; caption parse failure -> plain caption); retries re-seek the file."""
     ext = os.path.splitext(media_path)[1].lower()
@@ -197,6 +197,8 @@ async def _telegram_send_one_media(bot, chat_id, media_path, is_voice, *, captio
     # a multi-file send or a voice note.
     media_kwargs = {**thread_kwargs, **({"caption": caption, "parse_mode": parse_mode}
                                         if caption is not None and not voice_note else {})}
+    if reply_markup is not None:
+        media_kwargs["reply_markup"] = reply_markup
     if voice_note or ext in _TELEGRAM_SEND_AUDIO_EXTS:
         with contextlib.suppress(Exception):
             from plugins.platforms.telegram.adapter import _probe_voice_duration_seconds
@@ -255,9 +257,20 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, platform_config=None, review_candidate=None):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
+        review_adapter = review_row = review_markup = review_message_id = None
+        if review_candidate and platform_config is not None:
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+            from gateway.config import Platform
+            review_adapter = object.__new__(TelegramAdapter)
+            review_adapter.config = platform_config
+            review_adapter.platform = Platform.TELEGRAM
+            candidate_id = review_adapter._review_candidate_id({"review_candidate": review_candidate})
+            if candidate_id:
+                review_row = await asyncio.to_thread(review_adapter._resolve_review_candidate, candidate_id)
+                review_markup = review_adapter._review_candidate_reply_markup(review_row)
         formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -277,7 +290,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
         for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
+            if review_markup is not None and review_message_id is None:
+                text_kwargs["reply_markup"] = review_markup
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+            if review_message_id is None:
+                review_message_id = str(last_msg.message_id)
+            text_kwargs.pop("reply_markup", None)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
@@ -295,12 +313,17 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 last_msg = await _telegram_send_one_media(
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
-                    has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
+                    has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document,
+                    reply_markup=review_markup if review_message_id is None else None)
+                if review_message_id is None:
+                    review_message_id = str(last_msg.message_id)
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
+        if review_adapter is not None:
+            review_adapter._log_review_candidate_delivery(review_row, attached=review_markup is not None and review_message_id is not None, message_id=review_message_id, chat_id=chat_id, media_kind="media" if media_files else "text")
         return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}

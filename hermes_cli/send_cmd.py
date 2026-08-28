@@ -228,12 +228,19 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    review_candidate = None
+    if target.split(":", 1)[0].strip().lower() == "telegram":
+        from gateway.review_helper import extract_review_candidate_metadata
+        review_candidate, message = extract_review_candidate_metadata(message)
+
     # Lazy import keeps `hermes send --help` fast (no tool registry / gateway config stack).
     from tools.send_message_tool import send_message_tool
 
     # Routes to the platform adapter (bot-token path for built-ins, live-adapter path for plugin
     # platforms); takes the standard tool-call dict and returns a JSON string.
     tool_args = {"action": "send", "target": target, "message": message}
+    if review_candidate is not None:
+        tool_args["review_candidate"] = review_candidate
     if mentions:
         tool_args["mentions"] = mentions
     result = send_message_tool(tool_args)
