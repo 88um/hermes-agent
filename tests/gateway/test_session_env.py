@@ -14,6 +14,7 @@ from gateway.session_context import (
     _VAR_MAP,
     _UNSET,
 )
+from tools.environments.local import _make_run_env
 
 
 @pytest.fixture(autouse=True)
@@ -214,17 +215,24 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         connected_platforms=[],
         home_channels={},
         session_key="agent:main:telegram:dm:2144471399",
+        session_id="20260831_142449_f665f0ba",
     )
 
     tokens = runner._set_session_env(context)
     try:
-        result = await runner._run_in_executor_with_context(
-            lambda: {
+        def read_worker_session_env():
+            subprocess_env = _make_run_env({})
+            return {
                 "platform": get_session_env("HERMES_SESSION_PLATFORM"),
                 "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
                 "user_id": get_session_env("HERMES_SESSION_USER_ID"),
                 "session_key": get_session_env("HERMES_SESSION_KEY"),
+                "session_id": get_session_env("HERMES_SESSION_ID"),
+                "subprocess_session_id": subprocess_env.get("HERMES_SESSION_ID"),
             }
+
+        result = await runner._run_in_executor_with_context(
+            read_worker_session_env
         )
     finally:
         runner._clear_session_env(tokens)
@@ -235,6 +243,8 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "chat_id": "2144471399",
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
+        "session_id": "20260831_142449_f665f0ba",
+        "subprocess_session_id": "20260831_142449_f665f0ba",
     }
 
 
@@ -272,4 +282,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-
