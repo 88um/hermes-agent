@@ -126,6 +126,50 @@ class TestTelegramMultiImage:
         sizes = [len(c.kwargs["media"]) for c in adapter._bot.send_media_group.await_args_list]
         assert sizes == [10, 5]
 
+    def test_postgen_carousel_sends_album_then_slide_aware_control_card(
+        self, adapter, monkeypatch,
+    ):
+        import telegram
+        images = [(f"https://x.com/{i}.png", "") for i in range(2)]
+        telegram.InputMediaPhoto = MagicMock(
+            side_effect=lambda media, caption=None: {"media": media, "caption": caption},
+        )
+        adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=77))
+        candidate_row = {
+            "id": "carousel-1",
+            "candidate_shape": "carousel",
+            "media_count": 2,
+        }
+        monkeypatch.setattr(
+            adapter, "_resolve_postgen_candidate", lambda candidate_id: candidate_row,
+        )
+        control_markup = object()
+        monkeypatch.setattr(
+            adapter, "_postgen_candidate_reply_markup", lambda row: control_markup,
+        )
+        deliveries = []
+        monkeypatch.setattr(
+            adapter,
+            "_log_postgen_candidate_delivery",
+            lambda row, attached, message_id=None, duration_ms=None: deliveries.append(
+                (row, attached, message_id, duration_ms)
+            ),
+        )
+
+        _run(adapter.send_multiple_images(
+            "12345",
+            images,
+            metadata={"postgen_candidate": {"id": "carousel-1"}},
+        ))
+
+        adapter._bot.send_media_group.assert_awaited_once()
+        adapter._bot.send_message.assert_awaited_once()
+        control = adapter._bot.send_message.call_args.kwargs
+        assert control["text"] == "Review carousel"
+        assert control["reply_markup"] is control_markup
+        assert deliveries[0][:3] == (candidate_row, True, 77)
+        assert deliveries[0][3] is not None
+
 
 # ---------------------------------------------------------------------------
 # Discord
@@ -404,5 +448,3 @@ class TestEmailMultiImage:
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
-
-
