@@ -53,7 +53,10 @@ _ensure_telegram_mock()
 import pytest
 
 from gateway.platforms.base import BasePlatformAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _parse_postgen_candidate_callback,
+)
 
 
 CANDIDATE_ROW = {
@@ -151,6 +154,33 @@ def test_keyboard_uses_only_the_resolved_registry_row(adapter):
 def test_keyboard_is_none_for_unresolved_rows(adapter):
     assert adapter._postgen_candidate_reply_markup(None) is None
     assert adapter._postgen_candidate_reply_markup({}) is None
+
+
+def test_carousel_keyboard_targets_each_slide_and_callbacks_parse():
+    instance = object.__new__(_TestTelegramAdapter)
+    carousel = {
+        **CANDIDATE_ROW,
+        "candidate_shape": "carousel",
+        "media_count": 2,
+    }
+
+    keyboard = instance._postgen_candidate_reply_markup(carousel)
+
+    callback_data = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+    assert callback_data == [
+        "pg:a:gta6q1",
+        "pg:r:gta6q1",
+        "pg:v:gta6q1:s1",
+        "pg:v:gta6q1:s2",
+    ]
+    assert _parse_postgen_candidate_callback("pg:v:gta6q1:s2") == (
+        "revise", "gta6q1", 2,
+    )
+    assert _parse_postgen_candidate_callback("pg:a:gta6q1:s1") is None
 
 
 def test_candidate_id_extraction_rejects_unusable_ids(adapter, caplog):
