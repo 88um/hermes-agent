@@ -7239,6 +7239,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 import sys as _sys
                 _callback_started_ms = int(time.time() * 1000)
+                # The helper reaches postgen through a short-lived container of its own, so it
+                # needs the same session identity the sandbox gets. ContextVars do not cross a
+                # process boundary; bridge them onto the child's environment explicitly.
+                _helper_env = dict(os.environ)
+                try:
+                    from tools.environments.local import _inject_session_context_env as _bridge
+                    _bridge(_helper_env)
+                except Exception:
+                    pass
                 proc = await asyncio.create_subprocess_exec(
                     _sys.executable,
                     str(helper),
@@ -7249,6 +7258,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "--started-at-ms", str(_callback_started_ms),
                     *(["--slide-index", str(slide_index)] if slide_index is not None else []),
                     cwd=str(workdir),
+                    env=_helper_env,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
                 )

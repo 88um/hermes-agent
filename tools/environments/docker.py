@@ -25,6 +25,7 @@ from tools.environments.base import (
 )
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
+    _inject_session_context_env,
     _is_hermes_internal_secret,
 )
 
@@ -1548,6 +1549,13 @@ class DockerEnvironment(BaseEnvironment):
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """Return forwarded values and scoped names that must be unset."""
         exec_env: dict[str, str] = {}
+        # Session identity lives in ContextVars (gateway/session_context.py), not os.environ, so
+        # the name-based passthrough below resolves HERMES_SESSION_* to whatever a *previous*
+        # turn last mirrored globally -- or to nothing at all. The docker backend needs the same
+        # bridge tools/environments/local.py already applies, or a sandboxed command cannot tell
+        # which chat commissioned it. Applied first so the explicit/passthrough resolution below
+        # can still override a name deliberately.
+        _inject_session_context_env(exec_env)
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
         resolve_passthrough_value = None
