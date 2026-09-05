@@ -111,6 +111,46 @@ def _load_hermes_env_vars() -> dict[str, str]:
         return {}
 
 
+def bind_mount_args(host_path: str, container_path: str, readonly: bool = False) -> list[str]:
+    """``--mount`` arguments for one bind mount, for host paths ``-v`` cannot express.
+
+    ``-v host:container[:opts]`` is parsed by splitting on ``:``, so any host path
+    containing a colon is rejected outright::
+
+        docker: invalid spec: /…/docker/session:agent:main:telegram:dm:1066149310/home:/root:
+        too many colons
+
+    The persistent sandbox directory is ``get_sandbox_dir()/docker/<task_id>`` and a
+    task id *is* the session key, which is colon-separated by construction — so every
+    persistent sandbox on a platform-scoped session failed to start. ``--mount`` takes
+    ``key=value`` pairs instead and places no restriction on the path.
+
+    Sanitizing the directory name would have been the other fix; it is not the one taken,
+    because it moves the on-disk location of sandboxes existing installs already own.
+
+    ``--mount`` has its own unrepresentable character: it splits its ``key=value`` pairs on
+    commas and Docker offers no escape for one, so a path containing a comma would be read as
+    the end of ``src=`` and the start of a new option. A session key never contains one, but
+    ``HERMES_HOME`` or ``TERMINAL_SANDBOX_DIR`` is an arbitrary host path and might. That is
+    refused here, by name, rather than emitted as a spec that means something else — the failure
+    mode this whole function exists to remove.
+
+    An ``=`` in a path is fine: only the *first* one separates the key from its value, so
+    ``src=/a=b`` is the path ``/a=b``.
+    """
+    for label, value in (("src", host_path), ("dst", container_path)):
+        if "," in value:
+            raise ValueError(
+                f"Docker cannot express a bind mount whose {label} contains a comma: {value!r}. "
+                "--mount splits its options on commas and has no escape for one; move the "
+                "directory, or set HERMES_HOME/TERMINAL_SANDBOX_DIR to a comma-free path."
+            )
+    parts = ["type=bind", f"src={host_path}", f"dst={container_path}"]
+    if readonly:
+        parts.append("readonly")
+    return ["--mount", ",".join(parts)]
+
+
 # Docker label values must match [a-zA-Z0-9_.-] and stay ≤63 chars to round-trip
 # safely through `docker ps --filter label=key=value`. Profile and task names
 # can technically contain other characters; sanitize defensively.
@@ -984,15 +1024,11 @@ class DockerEnvironment(BaseEnvironment):
             sandbox = get_sandbox_dir() / "docker" / task_id
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
-            writable_args.extend([
-                "-v", f"{self._home_dir}:/root",
-            ])
+            writable_args.extend(bind_mount_args(self._home_dir, "/root"))
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 self._workspace_dir = str(sandbox / "workspace")
                 os.makedirs(self._workspace_dir, exist_ok=True)
-                writable_args.extend([
-                    "-v", f"{self._workspace_dir}:/workspace",
-                ])
+                writable_args.extend(bind_mount_args(self._workspace_dir, "/workspace"))
         else:
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
