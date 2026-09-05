@@ -435,6 +435,12 @@ def _handle_send(args):
     # JPGs where Telegram's sendPhoto recompresses to 1280px).
     force_document_attachments = "[[as_document]]" in message
 
+    postgen_candidate = None
+    if platform_name == "telegram":
+        postgen_candidate, message = (
+            BasePlatformAdapter.extract_postgen_candidate_metadata(message)
+        )
+
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
@@ -494,6 +500,14 @@ def _handle_send(args):
             review_candidate = sanitize_candidate_payload(args.get("review_candidate"))
             if review_candidate:
                 send_kwargs["review_candidate"] = review_candidate
+        # PostgenBot candidates: one send per candidate. The gateway's final-response path
+        # already turns ``[[postgen_candidate_id:...]]`` into adapter metadata, but a turn
+        # that prepares several candidates has only one final response, so the others could
+        # never carry their own buttons or report their own message ids. Sending one
+        # candidate's exact gateway result through this tool is that missing operation; the
+        # marker is stripped above and resolved by the registry helper the gateway uses.
+        if platform == Platform.TELEGRAM and postgen_candidate is not None:
+            send_kwargs["postgen_candidate"] = postgen_candidate
         # Preserve the exact built-in call contract; only custom handlers need
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
@@ -938,6 +952,7 @@ async def _send_to_platform(
     force_document=False,
     args=None,
     review_candidate=None,
+    postgen_candidate=None,
 ):
     """Route a message to the appropriate platform sender.
 
@@ -1022,6 +1037,7 @@ async def _send_to_platform(
             force_document=force_document,
             platform_config=pconfig,
             review_candidate=review_candidate,
+            postgen_candidate=postgen_candidate,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1359,6 +1375,7 @@ async def _send_telegram(
     force_document=False,
     platform_config=None,
     review_candidate=None,
+    postgen_candidate=None,
 ):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1370,6 +1387,63 @@ async def _send_telegram(
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
+
+        postgen_adapter = None
+        postgen_candidate_row = None
+        postgen_markup = None
+        if postgen_candidate and platform_config is not None:
+            from gateway.config import Platform
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+
+            # The same detached-adapter approach the review path uses below: the resolver, the
+            # keyboard, and the delivery logging are the running gateway's own code.
+            postgen_adapter = object.__new__(TelegramAdapter)
+            postgen_adapter.config = platform_config
+            postgen_adapter.platform = Platform.TELEGRAM
+            postgen_candidate_id = postgen_adapter._postgen_candidate_id(
+                {"postgen_candidate": postgen_candidate}
+            )
+            if postgen_candidate_id:
+                postgen_candidate_row = await asyncio.to_thread(
+                    postgen_adapter._resolve_postgen_candidate, postgen_candidate_id
+                )
+                postgen_markup = postgen_adapter._postgen_candidate_reply_markup(
+                    postgen_candidate_row
+                )
+
+        # Refuse a partial candidate, exactly as ``send_multiple_images`` does. A carousel that
+        # arrives with the wrong number of images is a bug upstream, and delivering the subset
+        # would leave a candidate whose registry shape and delivered media disagree — with
+        # buttons that revise slides nobody saw.
+        if postgen_candidate_row is not None:
+            expected_media = int(postgen_candidate_row.get("media_count") or 0)
+            shape = postgen_candidate_row.get("candidate_shape")
+            deliverable = [
+                path for path, is_voice in media_files
+                if not is_voice and os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+            ]
+            if shape == "carousel" and (
+                expected_media != len(deliverable) or len(deliverable) != len(media_files)
+            ):
+                postgen_adapter._log_postgen_candidate_delivery(
+                    postgen_candidate_row, attached=False,
+                )
+                logger.warning(
+                    "Refusing partial Postgen carousel delivery: expected=%d actual=%d",
+                    expected_media, len(deliverable),
+                )
+                return _error(
+                    "postgen_partial_carousel_refused: "
+                    f"expected {expected_media} images, got {len(deliverable)}"
+                )
+            if shape != "carousel" and expected_media and expected_media != len(media_files):
+                postgen_adapter._log_postgen_candidate_delivery(
+                    postgen_candidate_row, attached=False,
+                )
+                return _error(
+                    "postgen_media_count_mismatch: "
+                    f"expected {expected_media} files, got {len(media_files)}"
+                )
 
         review_adapter = None
         review_candidate_row = None
@@ -1478,6 +1552,12 @@ async def _send_telegram(
 
         last_msg = None
         review_message_id = None
+        # Every message this send produced, with the slide each one shows. A candidate can be
+        # several Telegram messages; a reply to any of them must resolve to this candidate and
+        # to that slide, so each id is reported with its own index.
+        postgen_bindings = []
+        postgen_album_sent = False
+        postgen_markup_attached = False
         warnings = []
 
         # MEDIA:<path> caption: when a single captionable file is accompanied
@@ -1513,6 +1593,17 @@ async def _send_telegram(
                 chunk_kwargs = dict(text_kwargs)
                 if review_candidate_markup is not None and chunk_index == 0:
                     chunk_kwargs["reply_markup"] = review_candidate_markup
+                # A single-image candidate whose text rides ahead of the image puts the
+                # keyboard on that text message; a carousel gets its own control card below.
+                if (
+                    postgen_markup is not None
+                    and chunk_index == 0
+                    and postgen_candidate_row is not None
+                    and postgen_candidate_row.get("candidate_shape") != "carousel"
+                    and not media_files
+                ):
+                    chunk_kwargs["reply_markup"] = postgen_markup
+                    postgen_markup_attached = True
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
@@ -1568,6 +1659,37 @@ async def _send_telegram(
                             review_message_id = str(last_msg.message_id)
                     else:
                         raise
+                if last_msg is not None:
+                    postgen_bindings.append(
+                        {"message_id": str(last_msg.message_id), "slide_index": None}
+                    )
+
+        # A candidate's carousel travels as one album, the way the gateway's own delivery path
+        # sends it, and each album message is bound to the slide it shows.
+        if (
+            postgen_candidate_row is not None
+            and postgen_candidate_row.get("candidate_shape") == "carousel"
+            and len(media_files) > 1
+        ):
+            from telegram import InputMediaPhoto
+
+            opened = [open(path, "rb") for path, _is_voice in media_files]
+            try:
+                group = await bot.send_media_group(
+                    chat_id=int_chat_id,
+                    media=[InputMediaPhoto(media=handle) for handle in opened],
+                    **thread_kwargs,
+                )
+            finally:
+                for handle in opened:
+                    handle.close()
+            for slide_index, album_message in enumerate(group, start=1):
+                last_msg = album_message
+                postgen_bindings.append(
+                    {"message_id": str(album_message.message_id), "slide_index": slide_index}
+                )
+            postgen_album_sent = True
+            media_files = []
 
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
@@ -1602,6 +1724,11 @@ async def _send_telegram(
                     if _tg_caption is not None and not (ext in _VOICE_EXTS and is_voice):
                         media_kwargs["caption"] = _tg_caption
                         media_kwargs["parse_mode"] = send_parse_mode
+                    # A single-image candidate carries its buttons on the image itself: that
+                    # message is the one the user presses and the one the binding names.
+                    if postgen_markup is not None and not postgen_markup_attached:
+                        media_kwargs["reply_markup"] = postgen_markup
+                        postgen_markup_attached = True
                     if (ext in _VOICE_EXTS and is_voice) or ext in _TELEGRAM_SEND_AUDIO_EXTS:
                         try:
                             from plugins.platforms.telegram.adapter import _probe_voice_duration_seconds
@@ -1699,6 +1826,28 @@ async def _send_telegram(
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
                 warnings.append(warning)
+                continue
+            if last_msg is not None:
+                postgen_bindings.append(
+                    {"message_id": str(last_msg.message_id), "slide_index": None}
+                )
+
+        # The carousel control card: Telegram attaches no inline keyboard to a media group, so
+        # the album is followed by one message that carries the candidate's controls. This is
+        # the adapter's own behaviour (``send_multiple_images``), not a new convention.
+        if postgen_album_sent and postgen_markup is not None:
+            control_message = await _send_telegram_message_with_retry(
+                bot,
+                chat_id=int_chat_id,
+                text="Review carousel",
+                reply_markup=postgen_markup,
+                **thread_kwargs,
+            )
+            last_msg = control_message
+            postgen_markup_attached = True
+            postgen_bindings.append(
+                {"message_id": str(control_message.message_id), "slide_index": None, "control": True}
+            )
 
         if last_msg is None:
             error = "No deliverable text or media remained after processing MEDIA tags"
@@ -1724,6 +1873,20 @@ async def _send_telegram(
             # callback binding point at the same Telegram message.
             "message_id": review_message_id or str(last_msg.message_id),
         }
+        if postgen_candidate_row is not None:
+            # One candidate, one send. postgen binds every id with its slide and records the
+            # receipt from the acknowledged media; ``buttons_attached`` is a separate fact about
+            # the controls, and must describe what happened rather than what was intended.
+            result["postgen_candidate_id"] = str(postgen_candidate_row.get("id") or "")
+            result["bindings"] = postgen_bindings
+            result["message_ids"] = [binding["message_id"] for binding in postgen_bindings]
+            result["buttons_attached"] = postgen_markup_attached
+            result["carousel_album"] = postgen_album_sent
+            postgen_adapter._log_postgen_candidate_delivery(
+                postgen_candidate_row,
+                attached=postgen_markup_attached,
+                message_id=postgen_bindings[0]["message_id"] if postgen_bindings else None,
+            )
         if warnings:
             result["warnings"] = warnings
         return result
