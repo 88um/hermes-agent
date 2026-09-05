@@ -860,7 +860,17 @@ class DockerEnvironment(BaseEnvironment):
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """See ``remote_common.resolve_passthrough_env``; explicit docker_forward_env bypasses the blocklist."""
-        return resolve_passthrough_env(self._forward_env, hermes_env_loader=_load_hermes_env_vars)
+        from gateway.session_context import _VAR_MAP, session_context_engaged
+        from tools.environments.local import _inject_session_context_env
+
+        exec_env, unset_names = resolve_passthrough_env(
+            self._forward_env, hermes_env_loader=_load_hermes_env_vars)
+        # Session ContextVars win over stale process-wide passthrough values.
+        _inject_session_context_env(exec_env)
+        if session_context_engaged():
+            unset_names.update(set(_VAR_MAP) - exec_env.keys())
+        unset_names.difference_update(exec_env)
+        return exec_env, unset_names
 
     def _build_runtime_env_args_with_unsets(self) -> tuple[list[str], tuple[str, ...], dict[str, str]]:
         """Runtime name-only forwarding args, names absent from scope, and the values
