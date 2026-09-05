@@ -257,11 +257,71 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, platform_config=None, review_candidate=None):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, platform_config=None, review_candidate=None, postgen_candidate=None):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
+        media_files = media_files or []
+        postgen_adapter = None
+        postgen_candidate_row = None
+        postgen_markup = None
+        if postgen_candidate and platform_config is not None:
+            from gateway.config import Platform
+            from plugins.platforms.telegram.adapter import TelegramAdapter
+
+            # The same detached-adapter approach the review path uses below: the resolver, the
+            # keyboard, and the delivery logging are the running gateway's own code.
+            postgen_adapter = object.__new__(TelegramAdapter)
+            postgen_adapter.config = platform_config
+            postgen_adapter.platform = Platform.TELEGRAM
+            postgen_candidate_id = postgen_adapter._postgen_candidate_id(
+                {"postgen_candidate": postgen_candidate}
+            )
+            if postgen_candidate_id:
+                postgen_candidate_row = await asyncio.to_thread(
+                    postgen_adapter._resolve_postgen_candidate, postgen_candidate_id
+                )
+                postgen_markup = postgen_adapter._postgen_candidate_reply_markup(
+                    postgen_candidate_row
+                )
+
+        # Refuse a partial candidate, exactly as ``send_multiple_images`` does. A carousel that
+        # arrives with the wrong number of images is a bug upstream, and delivering the subset
+        # would leave a candidate whose registry shape and delivered media disagree — with
+        # buttons that revise slides nobody saw.
+        if postgen_candidate_row is not None:
+            expected_media = int(postgen_candidate_row.get("media_count") or 0)
+            shape = postgen_candidate_row.get("candidate_shape")
+            deliverable = [
+                path for path, is_voice in media_files
+                if not is_voice and os.path.splitext(path)[1].lower() in _IMAGE_EXTS
+            ]
+            if shape == "carousel" and (
+                expected_media != len(deliverable) or len(deliverable) != len(media_files)
+            ):
+                postgen_adapter._log_postgen_candidate_delivery(
+                    postgen_candidate_row, attached=False,
+                )
+                logger.warning(
+                    "Refusing partial Postgen carousel delivery: expected=%d actual=%d",
+                    expected_media, len(deliverable),
+                )
+                return _error(
+                    "postgen_partial_carousel_refused: "
+                    f"expected {expected_media} images, got {len(deliverable)}"
+                )
+            if shape != "carousel" and expected_media and expected_media != len(media_files):
+                postgen_adapter._log_postgen_candidate_delivery(
+                    postgen_candidate_row, attached=False,
+                )
+                return _error(
+                    "postgen_media_count_mismatch: "
+                    f"expected {expected_media} files, got {len(media_files)}"
+                )
+
+        postgen_bindings = []
+        postgen_album_sent = postgen_markup_attached = False
         review_adapter = review_row = review_markup = review_message_id = None
-        if review_candidate and platform_config is not None:
+        if review_candidate and not postgen_candidate and platform_config is not None:
             from plugins.platforms.telegram.adapter import TelegramAdapter
             from gateway.config import Platform
             review_adapter = object.__new__(TelegramAdapter)
@@ -292,10 +352,43 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
             if review_markup is not None and review_message_id is None:
                 text_kwargs["reply_markup"] = review_markup
+            if postgen_markup is not None and not media_files and not postgen_markup_attached:
+                text_kwargs["reply_markup"] = postgen_markup
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
+            postgen_markup_attached |= text_kwargs.get("reply_markup") is postgen_markup and postgen_markup is not None
+            postgen_bindings.append({"message_id": str(last_msg.message_id), "slide_index": None})
             if review_message_id is None:
                 review_message_id = str(last_msg.message_id)
             text_kwargs.pop("reply_markup", None)
+        # A candidate's carousel travels as one album, the way the gateway's own delivery path
+        # sends it, and each album message is bound to the slide it shows.
+        if (
+            postgen_candidate_row is not None
+            and postgen_candidate_row.get("candidate_shape") == "carousel"
+            and len(media_files) > 1
+        ):
+            from telegram import InputMediaPhoto
+
+            opened = []
+            try:
+                for path, _is_voice in media_files:
+                    opened.append(open(path, "rb"))
+                group = await bot.send_media_group(
+                    chat_id=int_chat_id,
+                    media=[InputMediaPhoto(media=handle) for handle in opened],
+                    **thread_kwargs,
+                )
+            finally:
+                for handle in opened:
+                    handle.close()
+            for slide_index, album_message in enumerate(group, start=1):
+                last_msg = album_message
+                postgen_bindings.append(
+                    {"message_id": str(album_message.message_id), "slide_index": slide_index}
+                )
+            postgen_album_sent = True
+            media_files = []
+
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warnings.append(f"Media file not found, skipping: {media_path}")
@@ -314,17 +407,51 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 last_msg = await _telegram_send_one_media(
                     bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
                     has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document,
-                    reply_markup=review_markup if review_message_id is None else None)
+                    reply_markup=postgen_markup if not postgen_markup_attached and postgen_markup is not None else (review_markup if review_message_id is None else None))
+                postgen_markup_attached |= postgen_markup is not None
+                postgen_bindings.append({"message_id": str(last_msg.message_id), "slide_index": None})
                 if review_message_id is None:
                     review_message_id = str(last_msg.message_id)
             except Exception as e:
                 warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
                 logger.error(warnings[-1])
+        # The carousel control card: Telegram attaches no inline keyboard to a media group, so
+        # the album is followed by one message that carries the candidate's controls. This is
+        # the adapter's own behaviour (``send_multiple_images``), not a new convention.
+        if postgen_album_sent and postgen_markup is not None:
+            control_message = await _send_telegram_message_with_retry(
+                bot,
+                chat_id=int_chat_id,
+                text="Review carousel",
+                reply_markup=postgen_markup,
+                **thread_kwargs,
+            )
+            last_msg = control_message
+            postgen_markup_attached = True
+            postgen_bindings.append(
+                {"message_id": str(control_message.message_id), "slide_index": None, "control": True}
+            )
+
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
         if review_adapter is not None:
             review_adapter._log_review_candidate_delivery(review_row, attached=review_markup is not None and review_message_id is not None, message_id=review_message_id, chat_id=chat_id, media_kind="media" if media_files else "text")
-        return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
+        result = _success("telegram", chat_id, warnings, message_id=review_message_id if review_markup is not None else str(last_msg.message_id))
+        if postgen_candidate_row is not None:
+            # One candidate, one send. postgen binds every id with its slide and records the
+            # receipt from the acknowledged media; ``buttons_attached`` is a separate fact about
+            # the controls, and must describe what happened rather than what was intended.
+            result["postgen_candidate_id"] = str(postgen_candidate_row.get("id") or "")
+            result["bindings"] = postgen_bindings
+            result["message_ids"] = [binding["message_id"] for binding in postgen_bindings]
+            result["buttons_attached"] = postgen_markup_attached
+            result["carousel_album"] = postgen_album_sent
+            postgen_adapter._log_postgen_candidate_delivery(
+                postgen_candidate_row,
+                attached=postgen_markup_attached,
+                message_id=postgen_bindings[0]["message_id"] if postgen_bindings else None,
+            )
+        return result
     except ImportError:
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
