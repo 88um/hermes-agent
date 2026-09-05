@@ -4693,6 +4693,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Candidate telemetry helper missing.")
                 return
             import sys as _sys
+            from tools.environments.local import served_profile_child_env
+            _helper_env = served_profile_child_env()
             _callback_started_ms = int(time.time() * 1000)
             proc = await asyncio.create_subprocess_exec(
                 _sys.executable,
@@ -4704,6 +4706,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--started-at-ms", str(_callback_started_ms),
                 *(["--slide-index", str(slide_index)] if slide_index is not None else []),
                 cwd=str(workdir),
+                env=_helper_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
