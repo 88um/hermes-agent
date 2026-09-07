@@ -12,14 +12,167 @@ the repo's Dockerfile once per session.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
 import pytest
 
 IMAGE_TAG = os.environ.get("HERMES_TEST_IMAGE", "hermes-agent-harness:latest")
+
+# ---------------------------------------------------------------------------
+# Orphan reaping
+# ---------------------------------------------------------------------------
+#
+# Every container these tests create runs ``sleep infinity``, so an orphan
+# survives forever and holds its full memory footprint. Fixture teardown
+# covers the normal path, but pytest never runs teardown when the process
+# dies hard -- double Ctrl-C, SIGKILL, a CI timeout, or the OOM killer. We
+# found six such containers still alive 35 hours after the run that made
+# them, on a laptop that was by then swapping itself to death.
+#
+# Two nets catch that:
+#   1. Every name created here is registered below and removed in
+#      ``pytest_sessionfinish``. That also covers a fixture that raises
+#      *before* its ``yield`` -- pytest skips teardown entirely in that case.
+#   2. Before the first test runs, anything matching our naming scheme that
+#      is older than ``ORPHAN_TTL_S`` is reaped. The age gate is what makes
+#      this safe alongside a concurrently running suite: a live run's
+#      containers are minutes old, never hours.
+
+CONTAINER_PREFIXES = ("hermes-test-", "hermes-restart-")
+VOLUME_PREFIX = "hermes-restart-vol-"
+
+#: Objects older than this are treated as orphans from a crashed run. Set
+#: well above any real test duration so a parallel suite is never touched.
+ORPHAN_TTL_S = float(os.environ.get("HERMES_TEST_ORPHAN_TTL_S", 2 * 3600))
+
+_SESSION_CONTAINERS: set[str] = set()
+_SESSION_VOLUMES: set[str] = set()
+
+# Docker stamps RFC3339 with nanosecond precision ("...789012345Z"), which
+# datetime.fromisoformat rejects -- capture the parts we can parse.
+_RFC3339_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?")
+
+
+def _docker_cli(
+    *args: str, timeout: int = 30,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run ``docker <args>``, returning None instead of raising.
+
+    Reaping is best-effort housekeeping: a docker hiccup here must never
+    fail the suite.
+    """
+    try:
+        return subprocess.run(
+            ["docker", *args], capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def register_container(name: str) -> str:
+    """Track ``name`` for the end-of-session sweep and return it."""
+    _SESSION_CONTAINERS.add(name)
+    return name
+
+
+def register_volume(name: str) -> str:
+    """Track a named volume for the end-of-session sweep and return it."""
+    _SESSION_VOLUMES.add(name)
+    return name
+
+
+def force_remove_container(name: str) -> None:
+    """``docker rm -f`` ``name`` and drop it from the session registry."""
+    _docker_cli("rm", "-f", name, timeout=15)
+    _SESSION_CONTAINERS.discard(name)
+
+
+def force_remove_volume(name: str) -> None:
+    """``docker volume rm -f`` ``name`` and drop it from the registry.
+
+    Fails harmlessly while a container still references the volume.
+    """
+    _docker_cli("volume", "rm", "-f", name, timeout=15)
+    _SESSION_VOLUMES.discard(name)
+
+
+def _age_s(name: str, *inspect_args: str) -> float | None:
+    """Seconds since ``name`` was created, or None if it can't be read."""
+    r = _docker_cli(*inspect_args, timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    m = _RFC3339_RE.match(r.stdout.strip())
+    if m is None:
+        return None
+    try:
+        created = datetime.fromisoformat(
+            f"{m.group(1)}{(m.group(2) or '')[:7]}+00:00",
+        )
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - created).total_seconds()
+
+
+def _list_by_prefix(prefix: str, *list_args: str) -> list[str]:
+    """Names reported by ``docker <list_args>`` that start with ``prefix``.
+
+    The prefix is re-checked in Python so a daemon that treats the ``^``
+    anchor loosely can't widen what we delete.
+    """
+    r = _docker_cli(*list_args, timeout=15)
+    if r is None or r.returncode != 0:
+        return []
+    return [n for n in r.stdout.split() if n.startswith(prefix)]
+
+
+def reap_orphans(min_age_s: float) -> int:
+    """Remove leftover test containers/volumes older than ``min_age_s``.
+
+    Objects whose age can't be determined are left alone -- deleting on
+    "don't know" is exactly the case that could hit a parallel run.
+    Returns the number of objects removed.
+    """
+    removed = 0
+    for prefix in CONTAINER_PREFIXES:
+        for name in _list_by_prefix(
+            prefix, "ps", "-a", "--filter", f"name=^{prefix}",
+            "--format", "{{.Names}}",
+        ):
+            age = _age_s(name, "inspect", "-f", "{{.Created}}", name)
+            if age is None or age < min_age_s:
+                continue
+            force_remove_container(name)
+            removed += 1
+    for name in _list_by_prefix(
+        VOLUME_PREFIX, "volume", "ls", "--filter", f"name=^{VOLUME_PREFIX}",
+        "--format", "{{.Name}}",
+    ):
+        age = _age_s(
+            name, "volume", "inspect", "-f", "{{.CreatedAt}}", name,
+        )
+        if age is None or age < min_age_s:
+            continue
+        force_remove_volume(name)
+        removed += 1
+    return removed
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:  # noqa: ARG001
+    """Remove every container/volume this session created.
+
+    Fixture teardown normally does this; the registry catches what teardown
+    can't -- most importantly a fixture that failed before its ``yield``.
+    """
+    for name in list(_SESSION_CONTAINERS):
+        force_remove_container(name)
+    for name in list(_SESSION_VOLUMES):
+        force_remove_volume(name)
+
 
 
 def _docker_available() -> bool:
@@ -36,16 +189,25 @@ def _docker_available() -> bool:
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 - pytest hook
-    """Apply docker-suite policy: timeout bump + skip on missing docker."""
+    """Apply docker-suite policy: timeout bump + skip on missing docker.
+
+    Also reaps orphans from earlier crashed runs before the first test
+    starts -- this is the only net that catches a previous session killed
+    by SIGKILL or the OOM killer, which runs no teardown at all.
+    """
     docker_ok = _docker_available()
     skip_docker = pytest.mark.skip(
         reason="Docker not available or daemon not running",
     )
+    has_docker_items = False
     for item in items:
         if "tests/docker/" not in str(item.fspath).replace(os.sep, "/"):
             continue
+        has_docker_items = True
         if not docker_ok:
             item.add_marker(skip_docker)
+    if docker_ok and has_docker_items:
+        reap_orphans(ORPHAN_TTL_S)
 
 
 @pytest.fixture(scope="session")
@@ -74,12 +236,9 @@ def built_image() -> str:
 def container_name(request) -> Iterator[str]:
     """Generate a unique container name and ensure cleanup on test exit."""
     safe = request.node.name.replace("[", "_").replace("]", "_")
-    name = f"hermes-test-{safe}"
+    name = register_container(f"hermes-test-{safe}")
     yield name
-    subprocess.run(
-        ["docker", "rm", "-f", name],
-        capture_output=True, timeout=10,
-    )
+    force_remove_container(name)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +349,7 @@ def start_container(
     Returns the container name. Raises on ``docker run`` failure or if
     the container never finishes cont-init within 30s.
     """
+    register_container(name)
     args = ["docker", "run", "-d", "--name", name]
     for e in env:
         args.extend(["-e", e])

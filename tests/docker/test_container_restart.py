@@ -21,7 +21,18 @@ import time
 
 import pytest
 
-from tests.docker.conftest import docker_exec, docker_exec_sh, wait_for_path, wait_for_log, wait_for_docker_logs, poll_container
+from tests.docker.conftest import (
+    docker_exec,
+    docker_exec_sh,
+    force_remove_container,
+    force_remove_volume,
+    poll_container,
+    register_container,
+    register_volume,
+    wait_for_docker_logs,
+    wait_for_log,
+    wait_for_path,
+)
 
 
 def _docker(*args: str, **kw) -> subprocess.CompletedProcess[str]:
@@ -52,27 +63,34 @@ def restart_container(request, built_image: str):
     """A long-running container with a named volume so docker restart
     preserves $HERMES_HOME/profiles/."""
     safe = request.node.name.replace("[", "_").replace("]", "_")
-    name = f"hermes-restart-{safe}"
-    volume = f"hermes-restart-vol-{safe}"
+    name = register_container(f"hermes-restart-{safe}")
+    volume = register_volume(f"hermes-restart-vol-{safe}")
     _docker("rm", "-f", name)
     _docker("volume", "rm", "-f", volume)
     _docker("volume", "create", volume, timeout=10).check_returncode()
-    r = _docker(
-        "run", "-d", "--name", name,
-        "-v", f"{volume}:/opt/data",
-        built_image, "sleep", "infinity",
-        timeout=30,
-    )
-    r.check_returncode()
-    # Wait for s6 + stage2 + 02-reconcile to publish the boot log so
-    # the test can rely on the default slot being registered before
-    # it starts issuing commands. The reconciler always writes one
-    # 'default' line on every boot (PR #30136 item I1) — that's our
-    # readiness signal.
-    wait_for_log(name, "/opt/data/logs/container-boot.log", "profile=default")
-    yield name
-    _docker("rm", "-f", name)
-    _docker("volume", "rm", "-f", volume)
+    try:
+        r = _docker(
+            "run", "-d", "--name", name,
+            "-v", f"{volume}:/opt/data",
+            built_image, "sleep", "infinity",
+            timeout=30,
+        )
+        r.check_returncode()
+        # Wait for s6 + stage2 + 02-reconcile to publish the boot log so
+        # the test can rely on the default slot being registered before
+        # it starts issuing commands. The reconciler always writes one
+        # 'default' line on every boot (PR #30136 item I1) — that's our
+        # readiness signal.
+        wait_for_log(
+            name, "/opt/data/logs/container-boot.log", "profile=default",
+        )
+        yield name
+    finally:
+        # wait_for_log raises on a slow or broken boot. Without this the
+        # container and its volume would outlive the whole run: pytest
+        # skips teardown for a fixture that fails before its yield.
+        force_remove_container(name)
+        force_remove_volume(volume)
 
 
 
