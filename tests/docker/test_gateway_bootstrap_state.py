@@ -17,13 +17,19 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from tests.docker.conftest import docker_exec_sh, wait_for_container_ready
+from tests.docker.conftest import (
+    docker_exec_sh,
+    force_remove_container,
+    register_container,
+    wait_for_container_ready,
+)
 
 
 def _start_container(
     built_image: str, name: str, *env: str,
 ) -> str:
     """Start a container with given env vars, return its name."""
+    register_container(name)
     args = ["docker", "run", "-d", "--name", name]
     for e in env:
         args.extend(["-e", e])
@@ -81,31 +87,35 @@ def test_non_running_value_ignored(
 ) -> None:
     """Only literal 'running' is honored; any other value is ignored."""
     for bogus in ("stopped", "Running", "1", "true", "starting"):
-        # Need a fresh container per iteration
+        # Need a fresh container per iteration. The name is derived, so the
+        # container_name fixture never sees it — cleanup has to be local,
+        # and it has to be in a finally: a failing assert below used to
+        # strand this container for the lifetime of the daemon.
         name = f"{container_name}-{bogus}"
-        _start_container(
-            built_image, name,
-            f"HERMES_GATEWAY_BOOTSTRAP_STATE={bogus}",
-        )
-        r = docker_exec_sh(
-            name,
-            "test -f /opt/data/gateway_state.json && "
-            "echo EXISTS || echo ABSENT",
-            timeout=10,
-        )
-        assert "ABSENT" in r.stdout, (
-            f"bogus value {bogus!r} should not seed a state file: {r.stdout}"
-        )
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            capture_output=True, timeout=10,
-        )
+        try:
+            _start_container(
+                built_image, name,
+                f"HERMES_GATEWAY_BOOTSTRAP_STATE={bogus}",
+            )
+            r = docker_exec_sh(
+                name,
+                "test -f /opt/data/gateway_state.json && "
+                "echo EXISTS || echo ABSENT",
+                timeout=10,
+            )
+            assert "ABSENT" in r.stdout, (
+                f"bogus value {bogus!r} should not seed a state file: "
+                f"{r.stdout}"
+            )
+        finally:
+            force_remove_container(name)
 
 
 def _boot_with_bind_mount(
     built_image: str, name: str, host_dir: Path, *env: str,
 ) -> None:
     """Boot a container with host_dir bind-mounted to /opt/data."""
+    register_container(name)
     args = ["docker", "run", "-d", "--name", name,
             "-v", f"{host_dir}:/opt/data"]
     for e in env:
