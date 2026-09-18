@@ -45,6 +45,7 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
+        "TINYFISH_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -84,6 +85,7 @@ class TestBundledPluginsRegister:
             "parallel",
             "searxng",
             "tavily",
+            "tinyfish",
             "xai",
         ]
 
@@ -97,6 +99,7 @@ class TestBundledPluginsRegister:
             ("parallel", True, True),
             ("tavily", True, True),
             ("firecrawl", True, True),
+            ("tinyfish", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
         ],
@@ -117,7 +120,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "tinyfish", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -236,6 +239,16 @@ class TestIsAvailable:
         assert p is not None
         # Truthy or falsy, just must not raise.
         _ = bool(p.is_available())
+
+    def test_tinyfish_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("tinyfish")
+        assert p is not None
+        assert p.is_available() is False  # no TINYFISH_API_KEY
+        monkeypatch.setenv("TINYFISH_API_KEY", "real")
+        assert p.is_available() is True
 
     def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xAI needs XAI_API_KEY or OAuth tokens in auth.json."""
