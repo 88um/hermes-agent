@@ -199,3 +199,32 @@ def test_extract_http_error_marks_batch(monkeypatch: pytest.MonkeyPatch) -> None
     docs = TinyFishWebSearchProvider().extract(["https://a", "https://b"])
     assert len(docs) == 2
     assert all("boom" in d["error"] for d in docs)
+
+
+def test_extract_requests_image_links_and_appends_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TINYFISH_API_KEY", "k")
+    payload = {
+        "results": [
+            {
+                "url": "https://a",
+                "title": "TA",
+                "text": "body A",
+                "image_links": ["https://a/hero.jpg", "", "https://a/2.png"],
+            }
+        ],
+        "errors": [],
+    }
+    seen = {}
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        seen["json"] = json
+        return _FakeResponse(200, payload)
+
+    monkeypatch.setattr("plugins.web.tinyfish.provider.httpx.post", _fake_post)
+    docs = TinyFishWebSearchProvider().extract(["https://a"])
+    assert seen["json"]["image_links"] is True
+    assert docs[0]["content"].startswith("body A")
+    assert "## Images on this page" in docs[0]["content"]
+    assert "- https://a/hero.jpg" in docs[0]["content"]
+    assert "- https://a/2.png" in docs[0]["content"]
+    assert "- \n" not in docs[0]["content"]
