@@ -45,6 +45,7 @@ API (docs.tinyfish.ai):
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List
 
@@ -59,6 +60,7 @@ _FETCH_URL = "https://api.fetch.tinyfish.ai"
 
 # Fetch accepts at most 10 URLs per request (docs.tinyfish.ai).
 _FETCH_BATCH = 10
+_MAX_IMAGE_LINKS = 200
 
 _VALID_FORMATS = {"markdown", "html", "json"}
 
@@ -193,7 +195,7 @@ class TinyFishWebSearchProvider(WebSearchProvider):
                 batch = list(urls[start : start + _FETCH_BATCH])
                 response = httpx.post(
                     _FETCH_URL,
-                    json={"urls": batch, "format": fmt},
+                    json={"urls": batch, "format": fmt, "image_links": True},
                     headers=_tinyfish_headers(api_key),
                     timeout=120,
                 )
@@ -217,7 +219,18 @@ class TinyFishWebSearchProvider(WebSearchProvider):
                 for result in raw.get("results", []) or []:
                     url = result.get("url", "") or result.get("final_url", "")
                     text = result.get("text", "") or ""
+                    if not isinstance(text, str):
+                        text = json.dumps(text, ensure_ascii=False)
                     title = result.get("title", "") or ""
+                    image_links = [
+                        u for u in (result.get("image_links") or []) if isinstance(u, str) and u
+                    ]
+                    if image_links:
+                        # The web_extract tool forwards only url/title/content to the
+                        # model, so the page's <img src> URLs ride along inside content.
+                        text = text.rstrip() + "\n\n## Images on this page\n" + "\n".join(
+                            f"- {u}" for u in image_links[:_MAX_IMAGE_LINKS]
+                        )
                     documents.append(
                         {
                             "url": url,
