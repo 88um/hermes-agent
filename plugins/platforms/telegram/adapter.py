@@ -127,7 +127,11 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    try:
+        from telegram import ForceReply
+    except ImportError:
+        ForceReply = None
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -142,7 +146,7 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     Update = Bot = Message = InlineKeyboardButton = InlineKeyboardMarkup = Application = Any
     CommandHandler = CallbackQueryHandler = InlineQueryHandler = TypeHandler = TelegramMessageHandler = HTTPXRequest = Any
-    LinkPreviewOptions = filters = ParseMode = ChatType = None
+    ForceReply = LinkPreviewOptions = filters = ParseMode = ChatType = None
 
     # Mock so ContextTypes.DEFAULT_TYPE annotations don't crash class definition without the lib.
     class _MockContextTypes:
@@ -6147,11 +6151,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 return await super(TelegramAdapter, self).send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
 
         try:
-            result = await self._send_local_file(
-                "Image", actual_path, chat_id, reply_to, metadata, "photo",
-                lambda f: {"photo": f, "caption": self._caption_1024(caption), **({"reply_markup": reply_markup} if reply_markup else {})}, _photo_failed)
-            self._log_postgen_candidate_delivery(candidate_row, attached=result.success and reply_markup is not None, message_id=result.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
-            return result
+            if not self._bot:
+                return SendResult(success=False, error="Not connected")
+            if not os.path.exists(actual_path):
+                self._log_postgen_candidate_delivery(candidate_row, attached=False, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
+                return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
+            try:
+                with open(actual_path, "rb") as image_file:
+                    msg = await self._send_media(
+                        self._bot.send_photo, chat_id, reply_to, metadata, "photo",
+                        reset_media=lambda: image_file.seek(0), photo=image_file,
+                        caption=self._caption_1024(caption),
+                        **({"reply_markup": reply_markup} if reply_markup else {}))
+            except Exception as exc:
+                return await _photo_failed(exc)
+            self._log_postgen_candidate_delivery(
+                candidate_row, attached=reply_markup is not None, message_id=msg.message_id,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000))
+            return SendResult(success=True, message_id=str(msg.message_id))
         finally:
             if compressed:
                 with contextlib.suppress(OSError):
@@ -6265,6 +6282,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._log_postgen_candidate_delivery(candidate_row, attached=reply_markup is not None, message_id=msg.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
+                self._log_postgen_candidate_delivery(candidate_row, attached=False, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
@@ -7272,6 +7290,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
             return
+        if await self._maybe_handle_review_note_reply(msg):
+            return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
@@ -7581,8 +7601,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg, level=logging.INFO, what="media from unauthorized user")
-            return
-        if await self._maybe_handle_review_note_reply(msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):

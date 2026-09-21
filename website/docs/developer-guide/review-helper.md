@@ -88,3 +88,19 @@ events rather than edits to prior events.
 Postgen remains separate and unchanged: `[[postgen_candidate_id:<id>]]` and
 the `pg:a|r|v:<id>` callback lane continue to use the existing Postgen helper
 and registry.
+
+## Telegram sync port boundaries
+
+The Postgen compatibility lane accepts `[[postgen_candidate_id:<id>]]` and
+`pg:a/r/v:<id>` callbacks. Only revise accepts a slide suffix, `:s1` through
+`:s10`. A standalone carousel is an album followed by a **Review carousel**
+control card; its send result includes each message's slide/control binding.
+A mismatched standalone media count is refused before sending.
+
+This port does not change the external Postgen consumer (currently using its
+local backend inside a container). Existing final-response partial album
+fallback behavior remains: per-image fallback can be followed by a review
+card even when delivery was incomplete. The returned standalone bindings are
+not a fix for the consumer ledger's existing multi-binding gaps; the legacy
+delivery helper still receives one message ID. Neither limitation is claimed
+resolved by this port.
