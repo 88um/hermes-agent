@@ -409,3 +409,38 @@ def test_unbound_reply_to_review_prompt_is_consumed_and_not_agent_input(adapter)
     )
     assert asyncio.run(adapter._maybe_handle_review_note_reply(message)) is True
     assert calls[0][0] == "note"
+
+
+@pytest.mark.parametrize("prefix", ["rh", "rv"])
+def test_callback_dispatch_records_actual_actor(adapter, prefix):
+    events = []
+    adapter._is_callback_user_authorized = lambda *args, **kwargs: True
+    adapter._resolve_review_candidate = lambda candidate_id: CANDIDATE_ROW
+    adapter._invoke_review_helper = lambda operation, payload: events.append((operation, payload)) or {"ok": True}
+    query = _FakeQuery(f"{prefix}:f:candidate_123", user_id="actual-reviewer")
+    asyncio.run(adapter._handle_callback_query(SimpleNamespace(callback_query=query), None))
+    assert events[0][1]["actor"] == "actual-reviewer"
+    assert events[0][1]["verdict"] == "funny"
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+def test_text_intake_consumes_review_reply_before_group_gate(adapter, monkeypatch, authorized):
+    from unittest.mock import Mock
+    calls = []
+    adapter._is_user_authorized_from_message = lambda msg: True
+    adapter._is_callback_user_authorized = lambda *args, **kwargs: authorized
+    adapter._invoke_review_helper = lambda operation, payload: calls.append((operation, payload)) or {"ok": True}
+    adapter._review_note_prompts[("123", "88")] = {"candidate_id": "candidate_123"}
+    gate = Mock(return_value=False)
+    monkeypatch.setattr(adapter, "_gate_or_observe", gate)
+    message = SimpleNamespace(
+        text="Review feedback", message_id=89, chat=SimpleNamespace(id=123, type="group"),
+        from_user=SimpleNamespace(id="note-author"), message_thread_id=None,
+        reply_to_message=SimpleNamespace(message_id=88, text="review prompt"))
+    asyncio.run(adapter._handle_text_message(SimpleNamespace(effective_message=message), None))
+    gate.assert_not_called()
+    if authorized:
+        assert calls[0][1]["actor"] == "note-author"
+        assert calls[0][1]["note"] == "Review feedback"
+    else:
+        assert calls == []

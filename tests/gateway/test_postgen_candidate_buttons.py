@@ -430,3 +430,68 @@ def test_end_to_end_helper_marker_to_buttoned_send(adapter, monkeypatch, tmp_pat
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_postgen_callback_child_keeps_scoped_identity_across_profiles(adapter, monkeypatch, tmp_path):
+    """Exercise the real helper spawn A→B→A, with an unrelated process-level session mirror."""
+    import json
+    from unittest.mock import AsyncMock
+    from agent.secret_scope import set_multiplex_active
+    from gateway.session_context import set_session_vars, clear_session_vars
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    a = tmp_path / "a"
+    b = a / "profiles" / "b"
+    b.mkdir(parents=True)
+    work = tmp_path / "consumer"
+    (work / "scripts").mkdir(parents=True)
+    receipt = work / "receipt.json"
+    (work / "scripts" / "postgen_candidate_buttons.py").write_text(
+        "import json,os,sys\nfrom pathlib import Path\n"
+        "Path('receipt.json').write_text(json.dumps({'argv':sys.argv,'env':{k:os.getenv(k) for k in "
+        "['HERMES_HOME','HERMES_SESSION_ID','HERMES_SESSION_USER_ID','HERMES_SESSION_CHAT_ID','HERMES_SESSION_THREAD_ID']}}))\n"
+        "print(json.dumps({'ok':True,'label':'Recorded'}))\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-process-session")
+    monkeypatch.setenv("POSTGEN_BOT_WORKDIR", str(work))
+    monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *args, **kwargs: True)
+    set_multiplex_active(True)
+    try:
+        for home, session, actor, chat in ((a, "session-a", "101", "201"), (b, "session-b", "102", "202"), (a, "session-a2", "103", "203")):
+            token = set_hermes_home_override(str(home))
+            tokens = set_session_vars(platform="telegram", session_id=session, user_id=actor, chat_id=chat, thread_id="17")
+            try:
+                query = SimpleNamespace(
+                    data="pg:v:car001:s2", from_user=SimpleNamespace(id=int(actor), first_name="Reviewer"),
+                    message=SimpleNamespace(chat_id=int(chat), chat=SimpleNamespace(type="private"), message_thread_id=17, reply_text=AsyncMock()),
+                    answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+                asyncio.run(adapter._handle_callback_query(SimpleNamespace(callback_query=query), None))
+                seen = json.loads(receipt.read_text())
+                assert seen["env"] == dict(zip(
+                    ["HERMES_HOME", "HERMES_SESSION_ID", "HERMES_SESSION_USER_ID", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_THREAD_ID"],
+                    [str(home), session, actor, chat, "17"]))
+                assert seen["argv"][seen["argv"].index("--actor") + 1] == actor
+                assert seen["argv"][seen["argv"].index("--slide-index") + 1] == "2"
+                query.answer.assert_awaited_once_with(text="Recorded")
+            finally:
+                clear_session_vars(tokens)
+                reset_hermes_home_override(token)
+    finally:
+        set_multiplex_active(False)
+
+
+@pytest.mark.parametrize("data", ["pg:a:car001", "pg:r:car001", "pg:v:car001:s1", "pg:v:car001:s10"])
+def test_postgen_dispatch_denies_unauthorized_actor_before_spawning(adapter, monkeypatch, data):
+    from unittest.mock import AsyncMock
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *args, **kwargs: False)
+    query = SimpleNamespace(
+        data=data, from_user=SimpleNamespace(id=999, first_name="Unknown"),
+        message=SimpleNamespace(chat_id=123, chat=SimpleNamespace(type="private"), message_thread_id=None),
+        answer=AsyncMock(), edit_message_reply_markup=AsyncMock())
+    asyncio.run(adapter._handle_callback_query(SimpleNamespace(callback_query=query), None))
+    spawn.assert_not_awaited()
+    query.edit_message_reply_markup.assert_not_awaited()
+    assert "not authorized" in query.answer.await_args.kwargs["text"]

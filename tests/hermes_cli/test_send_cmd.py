@@ -564,4 +564,3 @@ def test_review_candidate_marker_becomes_metadata_and_is_not_delivered(
         }
     ]
     assert "review_candidate_id" not in capsys.readouterr().out
-

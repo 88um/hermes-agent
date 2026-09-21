@@ -134,7 +134,7 @@ def _pconfig():
 
 
 def _send(**kwargs):
-    from tools.send_message_tool import _send_telegram
+    from tools.send_message_senders import _send_telegram
 
     return asyncio.run(_send_telegram("tok", "123", kwargs.pop("message", ""), **kwargs))
 
