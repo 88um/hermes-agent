@@ -4821,6 +4821,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._accept_update()
         data = query.data
         cb = self._callback_ctx(query)
+        if data.startswith("fb:"):
+            await self._handle_feedback_callback(query)
+            return
         if data.startswith(("rh:", "rv:")):
             await self._handle_review_helper_callback(query, data, **{f"query_{key}": value for key, value in cb.items()})
             return
@@ -4842,6 +4845,25 @@ class TelegramAdapter(BasePlatformAdapter):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_feedback_callback(self, query) -> None:
+        """Hand an ``fb:`` button tap to the deployment's ``telegram_feedback`` module.
+
+        A deployment that attaches its own feedback buttons installs a module named
+        ``telegram_feedback`` on the gateway's import path exposing
+        ``async record_feedback(adapter, query)``. The tap is recorded there and never
+        enters the model conversation; the module answers the query and owns its own
+        authorization, since it runs before the adapter's user gate.
+        """
+        try:
+            from telegram_feedback import record_feedback
+        except ModuleNotFoundError as exc:
+            if exc.name != "telegram_feedback":
+                raise
+            logger.warning("[%s] fb: callback received but no telegram_feedback module is installed", self.name)
+            await query.answer(text="Feedback is not available.")
+            return
+        await record_feedback(self, query)
 
     async def _handle_approval_candidate_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         query_chat_id, query_chat_type = cb["chat_id"], cb["chat_type"]
