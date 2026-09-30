@@ -25,6 +25,23 @@ from gateway.platforms._shared import (
 )
 
 
+_APPROVAL_CANDIDATE_CALLBACK_RE = re.compile(
+    r"^ac:(a|r|v):([A-Za-z0-9_-]{1,48})(?::s([1-9]|10))?$"
+)
+
+
+def _parse_approval_candidate_callback(data: str) -> Optional[tuple[str, str, int | None]]:
+    """Return the candidate action, id, and optional slide target."""
+    match = _APPROVAL_CANDIDATE_CALLBACK_RE.fullmatch(data)
+    if match is None:
+        return None
+    action_code, candidate_id, slide_value = match.groups()
+    if slide_value is not None and action_code != "v":
+        return None
+    action = {"a": "approve", "r": "reject", "v": "revise"}[action_code]
+    return action, candidate_id, int(slide_value) if slide_value is not None else None
+
+
 # The approval helper gets this long to record a tap before it is killed.
 _APPROVAL_HELPER_TIMEOUT_S = 30
 
@@ -4825,16 +4842,11 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_approval_candidate_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         query_chat_id, query_chat_type = cb["chat_id"], cb["chat_type"]
         query_thread_id, query_user_name = cb["thread_id"], cb["user_name"]
-        parts = data.split(":", 2)
-        if len(parts) != 3:
+        parsed = _parse_approval_candidate_callback(data)
+        if parsed is None:
             await query.answer(text="Invalid candidate action.")
             return
-        action_code, candidate_id = parts[1], parts[2]
-        action_map = {"a": "approve", "r": "reject", "v": "revise"}
-        action = action_map.get(action_code)
-        if not action:
-            await query.answer(text="Invalid candidate action.")
-            return
+        action, candidate_id, slide_index = parsed
         caller_id = str(getattr(query.from_user, "id", ""))
         if not self._is_callback_user_authorized(
             caller_id,
@@ -4861,6 +4873,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--action", action,
                 "--actor", str(getattr(query.from_user, "id", "telegram")),
                 "--started-at-ms", str(_callback_started_ms),
+                *(["--slide-index", str(slide_index)] if slide_index is not None else []),
                 cwd=str(workdir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -5495,13 +5508,28 @@ class TelegramAdapter(BasePlatformAdapter):
         candidate_id = str(candidate_row.get("id") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", candidate_id):
             return None
-        return InlineKeyboardMarkup([
+        rows = [
             [
                 InlineKeyboardButton("✅ Approve", callback_data=f"ac:a:{candidate_id}"),
                 InlineKeyboardButton("❌ Reject", callback_data=f"ac:r:{candidate_id}"),
             ],
-            [InlineKeyboardButton("✏️ Revise", callback_data=f"ac:v:{candidate_id}")],
-        ])
+        ]
+        if candidate_row.get("candidate_shape") == "carousel":
+            media_count = int(candidate_row.get("media_count") or 0)
+            if not 2 <= media_count <= 10:
+                return None
+            rows.extend([
+                [InlineKeyboardButton(
+                    f"✏️ Revise slide {slide_index}",
+                    callback_data=f"ac:v:{candidate_id}:s{slide_index}",
+                )]
+                for slide_index in range(1, media_count + 1)
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton("✏️ Revise", callback_data=f"ac:v:{candidate_id}"),
+            ])
+        return InlineKeyboardMarkup(rows)
 
     def _log_approval_candidate_failure(self, candidate_id: str) -> None:
         """Structured telemetry for a candidate id that produced no buttons."""
@@ -6134,6 +6162,28 @@ class TelegramAdapter(BasePlatformAdapter):
             delivered = anim_result.success
         if not photos:
             return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+        candidate_id = self._approval_candidate_id(metadata)
+        candidate_row = await asyncio.to_thread(self._resolve_approval_candidate, candidate_id) if candidate_id else None
+        candidate_delivery_started = time.monotonic()
+        if candidate_row is not None and len(photos) > 1:
+            expected_media_count = int(candidate_row.get("media_count") or 0)
+            if (
+                candidate_row.get("candidate_shape") != "carousel"
+                or expected_media_count != len(photos)
+            ):
+                await asyncio.to_thread(self._log_approval_candidate_delivery,
+                    candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - candidate_delivery_started) * 1000),
+                )
+                logger.warning(
+                    "[%s] Refusing partial approval carousel delivery: expected=%d actual=%d",
+                    self.name,
+                    expected_media_count,
+                    len(photos),
+                )
+                return SendResult(success=False, error="Approval carousel media count mismatch")
+
         from urllib.parse import unquote as _unquote
         if any((metadata or {}).get(key) for key in ("approval_candidate", "review_candidate", "review_candidate_id")) and len(photos) == 1:
             image_url, alt_text = photos[0]
@@ -6183,7 +6233,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
-                fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_metadata = dict(metadata or {})
+                fallback_metadata.pop("approval_candidate", None)
+                fallback = await super().send_multiple_images(chat_id, chunk, fallback_metadata, human_delay=human_delay)
                 delivered = delivered or fallback.success
             finally:
                 for fh in opened_files:
@@ -6192,6 +6244,54 @@ class TelegramAdapter(BasePlatformAdapter):
                 for tmp in temp_paths:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
+        if candidate_row is not None:
+            reply_markup = self._approval_candidate_reply_markup(candidate_row)
+            if reply_markup is None:
+                await asyncio.to_thread(self._log_approval_candidate_delivery,
+                    candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - candidate_delivery_started) * 1000),
+                )
+                return SendResult(success=False, error="Invalid approval carousel keyboard")
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode,
+            )
+            thread_kwargs = self._thread_kwargs_for_send(
+                chat_id,
+                self._metadata_thread_id(metadata),
+                metadata,
+                reply_to_message_id=reply_to_id,
+                reply_to_mode=self._reply_to_mode,
+            )
+            try:
+                control_message = await self._send_with_dm_topic_reply_anchor_retry(
+                    self._bot.send_message,
+                    {
+                        "chat_id": normalize_telegram_chat_id(chat_id),
+                        "text": "Review carousel",
+                        "reply_markup": reply_markup,
+                        "reply_to_message_id": reply_to_id,
+                        **thread_kwargs,
+                        **self._notification_kwargs(metadata),
+                    },
+                    metadata,
+                    reply_to_id,
+                    "carousel control card",
+                )
+                await asyncio.to_thread(self._log_approval_candidate_delivery,
+                    candidate_row,
+                    attached=True,
+                    message_id=getattr(control_message, "message_id", None),
+                    duration_ms=int((time.monotonic() - candidate_delivery_started) * 1000),
+                )
+            except Exception:
+                await asyncio.to_thread(self._log_approval_candidate_delivery,
+                    candidate_row,
+                    attached=False,
+                    duration_ms=int((time.monotonic() - candidate_delivery_started) * 1000),
+                )
+                raise
+
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     async def send_image_file(
