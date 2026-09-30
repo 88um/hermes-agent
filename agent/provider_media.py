@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import base64
 import datetime
+import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from urllib.parse import urljoin
+
+logger = logging.getLogger(__name__)
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _MAX_SAVE_URL_REDIRECTS = 5
@@ -23,6 +27,24 @@ _MAX_SAVE_URL_REDIRECTS = 5
 def cache_dir(kind: str) -> Path:
     """Return ``$HERMES_HOME/cache/<kind>/``, creating parents as needed."""
     from hermes_constants import get_hermes_home
+    if kind == "images":
+        from hermes_cli.config import load_config
+        try:
+            section = load_config().get("image_gen", {})
+            override = section.get("output_dir") if isinstance(section, dict) else None
+        except Exception as exc:
+            logger.debug("Could not read image_gen.output_dir: %s", exc)
+            override = None
+        if isinstance(override, str) and override.strip():
+            try:
+                path = Path(override.strip()).expanduser()
+                path.mkdir(parents=True, exist_ok=True)
+                # mkdir(exist_ok=True) accepts an existing directory we cannot write into.
+                if not os.access(path, os.W_OK | os.X_OK):
+                    raise PermissionError(f"not writable: {path}")
+                return path
+            except OSError as exc:
+                logger.warning("image_gen.output_dir %r unusable (%s); using default cache dir", override, exc)
     path = get_hermes_home() / "cache" / kind
     path.mkdir(parents=True, exist_ok=True)
     return path
