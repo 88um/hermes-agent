@@ -87,3 +87,20 @@ events rather than edits to prior events.
 
 The approval-candidate lane below is separate: `[[approval_candidate_id:<id>]]`
 and `ac:a|r|v:<id>` callbacks use their own helper and registry.
+
+## Approval-candidate lane
+
+The lane's helpers live under the directory named by `APPROVAL_CANDIDATE_WORKDIR`:
+`scripts/approval_candidate_buttons.py` (resolve, delivery and action) and
+`scripts/action_log.py` (unresolved-candidate failures). With that variable
+unset no helper runs and no approval buttons are attached. The lane accepts
+`[[approval_candidate_id:<id>]]` and `ac:a/r/v:<id>` callbacks. Only revise
+accepts a slide suffix, `:s1` through `:s10`. A standalone carousel is an
+album followed by a **Review carousel** control card; its send result
+includes each message's slide/control binding.
+A mismatched standalone media count is refused before sending.
+
+Final-response partial album fallback behavior is unchanged: per-image
+fallback can be followed by a review card even when delivery was incomplete.
+The returned standalone bindings do not change how a consumer's ledger records
+several bindings; the delivery helper still receives one message ID.

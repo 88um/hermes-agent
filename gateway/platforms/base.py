@@ -1,8 +1,6 @@
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
-import base64
-import json
 import contextlib
 import inspect
 import ipaddress
