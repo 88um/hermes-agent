@@ -25,6 +25,16 @@ from gateway.platforms._shared import (
 )
 
 
+# The approval helper gets this long to record a tap before it is killed.
+_APPROVAL_HELPER_TIMEOUT_S = 30
+
+
+def _approval_candidate_workdir() -> Optional["_Path"]:
+    """The operator workdir holding the candidate helper scripts; None when unconfigured."""
+    workdir = os.getenv("APPROVAL_CANDIDATE_WORKDIR", "").strip()
+    return _Path(workdir) if workdir else None
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -4792,12 +4802,85 @@ class TelegramAdapter(BasePlatformAdapter):
                     await handler(query, data, chat_id)
                 return
         for prefix, handler in (
+            ("ac:", self._handle_approval_candidate_callback),
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_approval_candidate_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        query_chat_id, query_chat_type = cb["chat_id"], cb["chat_type"]
+        query_thread_id, query_user_name = cb["thread_id"], cb["user_name"]
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid candidate action.")
+            return
+        action_code, candidate_id = parts[1], parts[2]
+        action_map = {"a": "approve", "r": "reject", "v": "revise"}
+        action = action_map.get(action_code)
+        if not action:
+            await query.answer(text="Invalid candidate action.")
+            return
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to review this candidate.")
+            return
+        try:
+            workdir = _approval_candidate_workdir()
+            helper = workdir / "scripts" / "approval_candidate_buttons.py" if workdir else None
+            if helper is None or not helper.exists():
+                await query.answer(text="Candidate telemetry helper missing.")
+                return
+            import sys as _sys
+            _callback_started_ms = int(time.time() * 1000)
+            proc = await asyncio.create_subprocess_exec(
+                _sys.executable,
+                str(helper),
+                "action",
+                "--id", candidate_id,
+                "--action", action,
+                "--actor", str(getattr(query.from_user, "id", "telegram")),
+                "--started-at-ms", str(_callback_started_ms),
+                cwd=str(workdir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_APPROVAL_HELPER_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                # wait_for abandons the child; kill and reap it rather than leave it running.
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+                raise
+            if proc.returncode != 0:
+                await query.answer(text="Candidate action failed.")
+                return
+            result = json.loads(stdout.decode("utf-8") or "{}")
+            label = str(result.get("label") or "Candidate feedback logged.")[:180]
+            await query.answer(text=label)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if action == "revise" and query.message:
+                try:
+                    await query.message.reply_text("Reply with what you want changed and I’ll revise it.")
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[%s] approval candidate callback failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Candidate action failed.")
+        return
+
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
@@ -5308,6 +5391,180 @@ class TelegramAdapter(BasePlatformAdapter):
                 with contextlib.suppress(OSError):
                     os.unlink(_transcoded_voice_path)
 
+    def _approval_candidate_id(self, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        candidate = (metadata or {}).get("approval_candidate") if isinstance(metadata, dict) else None
+        if not isinstance(candidate, dict):
+            return None
+        candidate_id = str(candidate.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", candidate_id):
+            logger.warning(
+                "[%s] approval_candidate_directive_invalid: unusable candidate id "
+                "(len=%s); no buttons attached",
+                self.name, len(candidate_id),
+            )
+            return None
+        return candidate_id
+
+    def _resolve_approval_candidate(self, candidate_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve a short candidate id against the operator registry.
+
+        The helper registered the full candidate (result/gate paths, verification
+        state) before delivery; this only confirms the id exists, is still
+        pending, and returns its stored metadata. Unknown/stale/already-actioned
+        ids produce no buttons and a structured failure log.
+        """
+        try:
+            workdir = _approval_candidate_workdir()
+            helper = workdir / "scripts" / "approval_candidate_buttons.py" if workdir else None
+            if helper is None or not helper.exists():
+                logger.warning(
+                    "[%s] approval_candidate_unresolved: helper missing for id=%s",
+                    self.name, candidate_id,
+                )
+                self._log_approval_candidate_failure(candidate_id)
+                return None
+            import subprocess as _subprocess
+            import sys as _sys
+            completed = _subprocess.run(
+                [_sys.executable, str(helper), "resolve", "--id", candidate_id],
+                cwd=str(workdir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] approval_candidate_unresolved: id=%s not actionable in "
+                    "registry (rc=%d); no buttons attached",
+                    self.name, candidate_id, completed.returncode,
+                )
+                self._log_approval_candidate_failure(candidate_id)
+                return None
+            payload = json.loads(completed.stdout or "{}")
+            if not payload.get("ok"):
+                logger.warning(
+                    "[%s] approval_candidate_unresolved: id=%s rejected (%s); no buttons attached",
+                    self.name, candidate_id, payload.get("reason"),
+                )
+                self._log_approval_candidate_failure(candidate_id)
+                return None
+            row = payload.get("candidate")
+            if not isinstance(row, dict) or row.get("id") != candidate_id:
+                logger.warning(
+                    "[%s] approval_candidate_unresolved: id=%s registry response invalid; no buttons attached",
+                    self.name, candidate_id,
+                )
+                self._log_approval_candidate_failure(candidate_id)
+                return None
+            return row
+        except Exception as exc:
+            logger.warning(
+                "[%s] approval_candidate_unresolved: id=%s lookup failed: %s",
+                self.name, candidate_id, exc,
+            )
+            self._log_approval_candidate_failure(candidate_id)
+            return None
+
+    def _approval_candidate_reply_markup(self, candidate_row: Optional[Dict[str, Any]]):
+        if not isinstance(candidate_row, dict):
+            return None
+        candidate_id = str(candidate_row.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", candidate_id):
+            return None
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"ac:a:{candidate_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"ac:r:{candidate_id}"),
+            ],
+            [InlineKeyboardButton("✏️ Revise", callback_data=f"ac:v:{candidate_id}")],
+        ])
+
+    def _log_approval_candidate_failure(self, candidate_id: str) -> None:
+        """Structured telemetry for a candidate id that produced no buttons."""
+        try:
+            workdir = _approval_candidate_workdir()
+            action_log = workdir / "scripts" / "action_log.py" if workdir else None
+            if action_log is None or not action_log.exists():
+                return
+            import subprocess as _subprocess
+            import sys as _sys
+            completed = _subprocess.run(
+                [
+                    _sys.executable, str(action_log), "log",
+                    "--phase", "delivery",
+                    "--action", "candidate_send_failed",
+                    "--status", "failed",
+                    "--tool", "telegram",
+                    "--issue-code", "approval_candidate_unresolved",
+                    "--request-key", f"unknown:{candidate_id}",
+                    "--details", json.dumps({"reason": "unresolved_candidate", "id": candidate_id}, separators=(",", ":")),
+                ],
+                cwd=str(workdir),
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] approval_candidate_failure_log_failed: id=%s rc=%d",
+                    self.name, candidate_id, completed.returncode,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] approval_candidate_failure_log_failed: id=%s error=%s",
+                self.name, candidate_id, exc,
+            )
+
+    def _log_approval_candidate_delivery(
+        self,
+        candidate_row: Optional[Dict[str, Any]],
+        attached: bool,
+        message_id: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        """Record candidate delivery only after Telegram confirmed the send.
+
+        ``candidate_sent`` requires a non-null reply markup on a successful
+        photo send; anything else is recorded as a structured failure so
+        delivery telemetry can never claim buttons that were never sent.
+        """
+        if not isinstance(candidate_row, dict) or not candidate_row.get("id"):
+            return
+        workdir = _approval_candidate_workdir()
+        helper = workdir / "scripts" / "approval_candidate_buttons.py" if workdir else None
+        if helper is None or not helper.exists():
+            return
+        try:
+            import subprocess as _subprocess
+            import sys as _sys
+            args = [
+                _sys.executable, str(helper), "delivery",
+                "--id", str(candidate_row["id"]),
+                "--buttons-attached" if attached else "--no-buttons-attached",
+                *(["--message-id", str(message_id)] if message_id is not None else []),
+                *(["--duration-ms", str(duration_ms)] if duration_ms is not None else []),
+            ]
+            completed = _subprocess.run(
+                args,
+                cwd=str(workdir),
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            if completed.returncode != 0:
+                logger.warning(
+                    "[%s] approval_candidate_delivery_log_failed: id=%s rc=%d",
+                    self.name, candidate_row["id"], completed.returncode,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] approval_candidate_delivery_log_failed: id=%s error=%s",
+                self.name, candidate_row.get("id"), exc,
+            )
+
     async def send_multiple_images(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
@@ -5331,6 +5588,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not photos:
             return SendResult(success=delivered, error=None if delivered else "all images failed to send")
         from urllib.parse import unquote as _unquote
+        if (metadata or {}).get("approval_candidate") and len(photos) == 1:
+            image_url, alt_text = photos[0]
+            if image_url.startswith("file://"):
+                return await self.send_image_file(chat_id, _unquote(image_url[7:]), alt_text, metadata=metadata)
+            return await self.send_image(chat_id, image_url, alt_text, metadata=metadata)
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
         for chunk_idx, chunk in enumerate(chunks):
@@ -5391,11 +5653,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a local image file natively as a Telegram photo."""
         # Pre-compress large raster images to progressive JPEG once; the photo send and the document
         # fallback both reuse the compressed file so either upload stays under media_write_timeout.
+        _delivery_started = time.monotonic()
+        candidate_id = self._approval_candidate_id(metadata)
+        candidate_row = await asyncio.to_thread(self._resolve_approval_candidate, candidate_id) if candidate_id else None
+        reply_markup = self._approval_candidate_reply_markup(candidate_row)
         compressed = self._compress_image_to_jpeg(image_path)
         actual_path = compressed or image_path
         doc_name = os.path.splitext(os.path.basename(image_path))[0] + ".jpg" if compressed else os.path.basename(image_path)
 
         async def _photo_failed(e: Exception) -> SendResult:
+            await asyncio.to_thread(self._log_approval_candidate_delivery, candidate_row, attached=False, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
             error_str = str(e)
             # Dimension errors are expected for valid images Telegram refuses as photos → INFO.
             if "Photo_invalid_dimensions" in error_str or "PHOTO_INVALID_DIMENSIONS" in error_str:
@@ -5416,9 +5683,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 return await super(TelegramAdapter, self).send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
 
         try:
-            return await self._send_local_file(
+            result = await self._send_local_file(
                 "Image", actual_path, chat_id, reply_to, metadata, "photo",
-                lambda f: {"photo": f, "caption": self._caption_1024(caption)}, _photo_failed)
+                lambda f: {"photo": f, "caption": self._caption_1024(caption), **({"reply_markup": reply_markup} if reply_markup else {})}, _photo_failed)
+            await asyncio.to_thread(self._log_approval_candidate_delivery, candidate_row, attached=result.success and reply_markup is not None, message_id=result.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
+            return result
         finally:
             if compressed:
                 with contextlib.suppress(OSError):
@@ -5498,14 +5767,24 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a URL image as a Telegram photo: URL send (<5MB) → download+upload (≤10MB) → base text."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        candidate_id = self._approval_candidate_id(metadata)
+        candidate_row = await asyncio.to_thread(self._resolve_approval_candidate, candidate_id) if candidate_id else None
+        _delivery_started = time.monotonic()
+        reply_markup = self._approval_candidate_reply_markup(candidate_row)
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
+            await asyncio.to_thread(self._log_approval_candidate_delivery,
+                candidate_row,
+                attached=False,
+                duration_ms=int((time.monotonic() - _delivery_started) * 1000),
+            )
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
         photo_caption = self._caption_1024(caption)
         try:
             msg = await self._send_media(
-                self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption)
+                self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
+            await asyncio.to_thread(self._log_approval_candidate_delivery, candidate_row, attached=reply_markup is not None, message_id=msg.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
@@ -5518,7 +5797,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     resp.raise_for_status()
                     image_data = resp.content
                 msg = await self._send_media(
-                    self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption)
+                    self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption, **({"reply_markup": reply_markup} if reply_markup else {}))
+                await asyncio.to_thread(self._log_approval_candidate_delivery, candidate_row, attached=reply_markup is not None, message_id=msg.message_id, duration_ms=int((time.monotonic() - _delivery_started) * 1000))
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)

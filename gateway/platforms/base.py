@@ -1,6 +1,8 @@
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
+import base64
+import json
 import contextlib
 import inspect
 import ipaddress
@@ -3315,6 +3317,63 @@ class BasePlatformAdapter(ABC):
         return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
 
     @staticmethod
+    def extract_approval_candidate_metadata(content: str) -> Tuple[Optional[dict], str]:
+        """Extract and strip an approval-candidate button directive.
+
+        The directive shape is ``[[approval_candidate_id:<short-id>]]`` — a short,
+        low-entropy, human-copyable id emitted by the operator helper, which has
+        already registered the full candidate (result/gate paths, verification
+        state) locally before delivery. The id is intentionally the only thing
+        that travels through model output: opaque base64 tokens get abbreviated
+        by tool-output redaction and must never be relayed by the model again.
+        Adapters resolve the id against the local registry; Telegram callback
+        data stays a short ``ac:<action>:<id>`` payload.
+
+        Any directive-looking token that is not a well-formed short id — the
+        legacy base64 form, an ellipsized/redacted token containing ``...``,
+        empty or over-long ids — is stripped from user-visible text, logged with
+        the stable code ``approval_candidate_directive_invalid``, and never
+        yields candidate metadata (so it can never be counted as a delivery).
+        """
+        if "[[approval_candidate" not in content:
+            return None, content
+
+        pattern = re.compile(r"\[\[approval_candidate(?:_id)?:([^\]]*)\]\]")
+        candidate: Optional[dict] = None
+
+        def _remove(match: re.Match) -> str:
+            nonlocal candidate
+            is_short_form = match.group(0).startswith("[[approval_candidate_id:")
+            token = match.group(1).strip()
+            if candidate is None and is_short_form and re.fullmatch(r"[A-Za-z0-9_-]{1,48}", token):
+                candidate = {"id": token}
+            else:
+                logger.warning(
+                    "approval_candidate_directive_invalid: stripped malformed or "
+                    "abbreviated candidate directive (len=%d); no buttons attached",
+                    len(token),
+                )
+            return ""
+
+        cleaned = pattern.sub(_remove, content)
+        # Also remove an unterminated directive through the end of its line.
+        # The closed-token regex above cannot see this malformed case, but it
+        # must never leak private protocol text into the Telegram caption.
+        if "[[approval_candidate" in cleaned:
+            cleaned, malformed_count = re.subn(
+                r"\[\[approval_candidate[^\r\n]*",
+                "",
+                cleaned,
+            )
+            for _ in range(malformed_count):
+                logger.warning(
+                    "approval_candidate_directive_invalid: stripped unterminated "
+                    "candidate directive; no buttons attached"
+                )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return candidate, cleaned
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """Bare local file paths (absolute, ``~/`` or drive-letter) with deliverable extensions ->
         ``(expanded_paths, cleaned_text)``. Candidates must exist on disk (URLs / hallucinated paths
@@ -4522,11 +4581,15 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
+                _approval_candidate, response = self.extract_approval_candidate_metadata(response)
                 extracted = await self._extract_response_content(
                     response, event, session_key, is_ephemeral_response=is_ephemeral_response)
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if _approval_candidate:
+                    _final_thread_metadata = dict(_final_thread_metadata or {})
+                    _final_thread_metadata["approval_candidate"] = _approval_candidate
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
