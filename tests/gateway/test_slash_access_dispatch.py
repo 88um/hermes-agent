@@ -355,6 +355,29 @@ async def test_running_agent_fastpath_allows_admin_command():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["status", "context"])
+async def test_running_agent_fastpath_gates_session_state_commands(command):
+    """/status and /context mid-turn obey the same gate an idle session applies:
+    refused for a user whose commands exclude them, answered once allowed."""
+    runner = _make_runner(
+        platform_extra={"allow_admin_from": ["111"], "user_allowed_commands": []}
+    )
+    src = _make_source(user_id="222")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    handler = AsyncMock(return_value=f"{command}-handled")
+    setattr(runner, f"_handle_{command}_command", handler)
+
+    denied = await runner._handle_message(_make_event(f"/{command}", src))
+    assert "⛔" in denied
+    handler.assert_not_awaited()
+
+    runner.config.platforms[Platform.DISCORD].extra["user_allowed_commands"] = [command]
+    assert await runner._handle_message(_make_event(f"/{command}", src)) == f"{command}-handled"
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.

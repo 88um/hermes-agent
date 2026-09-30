@@ -632,16 +632,17 @@ class GatewayInboundMixin:
         _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
         if _cmd_def_inner:
-            # /status and /context are intentionally pre-gate so users always see session state.
+            # Slash access control mirrors the cold-path gate so non-admins can't bypass gating
+            # just because an agent is busy. /status and /context pass through it too: a user
+            # whose commands are limited must not run them mid-turn when an idle session would
+            # refuse them. /help and /whoami are the always-allowed floor.
+            _denied = self._check_slash_access(source, _cmd_def_inner.name)
+            if _denied is not None:
+                return True, _denied
             if _cmd_def_inner.name == "status":
                 return True, await self._handle_status_command(event)
             if _cmd_def_inner.name == "context":
                 return True, await self._handle_context_command(event)
-            # Slash access control mirrors the cold-path gate so non-admins can't bypass gating
-            # just because an agent is busy. /help and /whoami are the always-allowed floor.
-            _denied = self._check_slash_access(source, _cmd_def_inner.name)
-            if _denied is not None:
-                return True, _denied
             # Any recognized slash command dispatches per its declared busy_policy (dispatch /
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
