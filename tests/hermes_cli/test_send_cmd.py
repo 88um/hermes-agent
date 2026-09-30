@@ -459,3 +459,30 @@ def test_help_and_empty_list_hint_name_the_resolved_home(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert str(home / "channel_directory.json") in out
     assert "~/.hermes" not in out
+
+
+def test_review_candidate_marker_becomes_metadata_and_is_not_delivered(
+    fake_tool, capsys, monkeypatch
+):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    args = _parse(
+        [
+            "--to",
+            "telegram:123",
+            "Candidate text\n[[review_candidate_id:candidate_123]]",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [
+        {
+            "action": "send",
+            "target": "telegram:123",
+            "message": "Candidate text",
+            "review_candidate": {"id": "candidate_123"},
+        }
+    ]
+    assert "review_candidate_id" not in capsys.readouterr().out
