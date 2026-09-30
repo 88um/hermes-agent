@@ -515,5 +515,34 @@ def test_approval_helper_that_hangs_is_killed_and_reaped(adapter, monkeypatch, t
     query.answer.assert_awaited_once_with(text="Candidate action failed.")
 
 
+def test_approval_tap_gives_the_helper_the_tapping_chat_identity(adapter, monkeypatch, tmp_path):
+    """A tap is not an agent turn: nothing binds its session context, so the helper must still
+    receive the tapping chat's identity rather than none (or another turn's)."""
+    import json
+    import gateway.session_context as session_context
+
+    work = tmp_path / "work"
+    (work / "scripts").mkdir(parents=True)
+    names = ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_TYPE",
+             "HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID", "HERMES_SESSION_MESSAGE_ID"]
+    (work / "scripts" / "approval_candidate_buttons.py").write_text(
+        "import json,os\nfrom pathlib import Path\n"
+        f"Path('receipt.json').write_text(json.dumps({{k: os.getenv(k) for k in {names!r}}}))\n"
+        "print(json.dumps({'ok': True, 'label': 'Recorded'}))\n"
+    )
+    monkeypatch.setenv("APPROVAL_CANDIDATE_WORKDIR", str(work))
+    # A previous turn engaged the session context and left its chat in the process mirror.
+    monkeypatch.setattr(session_context, "_session_context_engaged", True)
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "another-turns-chat")
+    monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *args, **kwargs: True)
+
+    query = _tap("ac:a:car001")
+    asyncio.run(adapter._handle_callback_query(SimpleNamespace(callback_query=query), None))
+
+    query.answer.assert_awaited_once_with(text="Recorded")
+    assert json.loads((work / "receipt.json").read_text()) == dict(zip(
+        names, ["telegram", "201", "dm", "17", "101", "555"]))
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

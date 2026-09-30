@@ -10,7 +10,7 @@ import os
 import html as _html
 import re
 import time
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
@@ -4864,6 +4864,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="Candidate telemetry helper missing.")
                 return
             import sys as _sys
+            _helper_env = self._approval_helper_env(query, cb, caller_id)
             _callback_started_ms = int(time.time() * 1000)
             proc = await asyncio.create_subprocess_exec(
                 _sys.executable,
@@ -4875,6 +4876,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "--started-at-ms", str(_callback_started_ms),
                 *(["--slide-index", str(slide_index)] if slide_index is not None else []),
                 cwd=str(workdir),
+                env=_helper_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -4905,6 +4907,37 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] approval candidate callback failed: %s", self.name, exc, exc_info=True)
             await query.answer(text="Candidate action failed.")
         return
+
+    @staticmethod
+    def _approval_helper_env(query, cb: Dict[str, Any], caller_id: str) -> Dict[str, str]:
+        """The approval helper's child env, carrying the tapping chat's identity.
+
+        A button tap is not an agent turn, so no session context is bound for it and the
+        child env would otherwise carry no chat identity (or another turn's). The tap's
+        identity is bound in a copied context so it never leaks into later updates.
+        """
+        from gateway.session_context import _VAR_MAP
+        from tools.environments.local import served_profile_child_env
+
+        message = getattr(query, "message", None)
+        raw_chat_type = cb["chat_type"]
+        identity = {
+            "HERMES_SESSION_PLATFORM": Platform.TELEGRAM.value,
+            "HERMES_SESSION_CHAT_ID": cb["chat_id"],
+            "HERMES_SESSION_CHAT_TYPE": None if raw_chat_type is None else TelegramAdapter._normalize_chat_type(
+                raw_chat_type, is_forum=getattr(getattr(message, "chat", None), "is_forum", False) is True),
+            "HERMES_SESSION_THREAD_ID": cb["thread_id"],
+            "HERMES_SESSION_USER_ID": caller_id,
+            "HERMES_SESSION_USER_NAME": cb["user_name"],
+            "HERMES_SESSION_MESSAGE_ID": getattr(message, "message_id", None),
+        }
+
+        def build() -> Dict[str, str]:
+            for name, value in identity.items():
+                _VAR_MAP[name].set("" if value is None else str(value))
+            return served_profile_child_env()
+
+        return copy_context().run(build)
 
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
